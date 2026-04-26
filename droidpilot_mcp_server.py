@@ -248,6 +248,184 @@ class NavigationMemory:
             "screen": screen,
         }
 
+    def save_learning(
+        self,
+        *,
+        screen_name: str = "",
+        goal: str = "",
+        route: list[str] | None = None,
+        visual_cues: list[str] | None = None,
+        useful_actions: list[str] | None = None,
+        assertions: list[str] | None = None,
+        blockers: list[str] | None = None,
+        notes: str = "",
+        confidence: float = 0.7,
+        app_package: str = "",
+    ) -> dict[str, Any]:
+        display_screen_name = screen_name.strip()
+        display_goal = goal.strip()
+        if not display_screen_name and not display_goal:
+            raise ValueError("screen_name ou goal eh obrigatorio para salvar aprendizado de navegacao")
+
+        now = int(time.time() * 1000)
+        safe_confidence = max(0.0, min(1.0, float(confidence)))
+        screen_id = sanitize_filename(display_screen_name or display_goal)
+        route_steps = normalize_string_list(route)
+        cues = normalize_string_list(visual_cues)
+        actions = normalize_string_list(useful_actions)
+        checks = normalize_string_list(assertions)
+        blocker_items = normalize_string_list(blockers)
+        note_text = notes.strip()
+        package_name = app_package.strip()
+
+        with self._lock:
+            guide = self._read_unlocked()
+            project_navigation = self._project_navigation(guide)
+            screens = project_navigation.setdefault("screens", {})
+            screen = screens.setdefault(
+                screen_id,
+                {
+                    "screenName": display_screen_name or display_goal,
+                    "goals": [],
+                    "visualCues": [],
+                    "usefulActions": [],
+                    "assertions": [],
+                    "blockers": [],
+                    "notes": [],
+                    "packages": [],
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "confidence": safe_confidence,
+                },
+            )
+
+            self._replace_if_present(screen, "screenName", display_screen_name or screen.get("screenName", ""))
+            screen["goals"] = merge_unique_strings(screen.get("goals"), [display_goal] if display_goal else [])
+            screen["visualCues"] = merge_unique_strings(screen.get("visualCues"), cues)
+            screen["usefulActions"] = merge_unique_strings(screen.get("usefulActions"), actions)
+            screen["assertions"] = merge_unique_strings(screen.get("assertions"), checks)
+            screen["blockers"] = merge_unique_strings(screen.get("blockers"), blocker_items)
+            screen["packages"] = merge_unique_strings(screen.get("packages"), [package_name] if package_name else [])
+            if note_text:
+                screen.setdefault("notes", []).append({"timestamp": now, "text": note_text})
+            screen["confidence"] = max(float(screen.get("confidence") or 0.0), safe_confidence)
+            screen["updatedAt"] = now
+
+            if route_steps:
+                route_id = sanitize_filename(f"{display_goal or display_screen_name}-{screen_id}")
+                routes = project_navigation.setdefault("routes", {})
+                route_payload = routes.setdefault(
+                    route_id,
+                    {
+                        "goal": display_goal,
+                        "targetScreen": display_screen_name,
+                        "steps": [],
+                        "packages": [],
+                        "createdAt": now,
+                        "updatedAt": now,
+                        "confidence": safe_confidence,
+                    },
+                )
+                self._replace_if_present(route_payload, "goal", display_goal)
+                self._replace_if_present(route_payload, "targetScreen", display_screen_name)
+                route_payload["steps"] = merge_unique_strings(route_payload.get("steps"), route_steps)
+                route_payload["packages"] = merge_unique_strings(route_payload.get("packages"), [package_name] if package_name else [])
+                route_payload["confidence"] = max(float(route_payload.get("confidence") or 0.0), safe_confidence)
+                route_payload["updatedAt"] = now
+
+            project_navigation["knownActions"] = merge_unique_strings(project_navigation.get("knownActions"), actions)
+            project_navigation["blockers"] = merge_unique_strings(project_navigation.get("blockers"), blocker_items)
+            project_navigation["updatedAt"] = now
+            guide["version"] = 2
+            guide["updatedAt"] = now
+            self._write_unlocked(guide)
+
+        command_path = self.recorder.record_command(
+            command_name="save_navigation_learning",
+            request_payload={
+                "appPackage": package_name,
+                "screenName": display_screen_name,
+                "goal": display_goal,
+                "route": route_steps,
+                "visualCues": cues,
+                "usefulActions": actions,
+                "assertions": checks,
+                "blockers": blocker_items,
+                "notes": notes,
+                "confidence": safe_confidence,
+            },
+            response_payload={"success": True, "navigationMemoryPath": str(self.path.resolve()), "screenId": screen_id},
+        )
+        return {
+            "success": True,
+            "message": "Navigation learning saved",
+            "navigationMemoryPath": str(self.path.resolve()),
+            "commandLogPath": str(command_path.resolve()),
+            "screenId": screen_id,
+            "screenName": display_screen_name,
+            "goal": display_goal,
+        }
+
+    def context(self, *, goal: str = "", max_items: int = 8) -> dict[str, Any]:
+        limit = max(1, min(int(max_items or 8), 25))
+        goal_text = goal.strip()
+        with self._lock:
+            guide = self._read_unlocked()
+
+        project_navigation = self._project_navigation(guide)
+        screens = list(project_navigation.get("screens", {}).values())
+        routes = list(project_navigation.get("routes", {}).values())
+        old_screens = self._legacy_screens(guide)
+        events = list(project_navigation.get("recentEvents") or guide.get("recentEvents") or [])[-limit:]
+
+        filtered_screens = rank_navigation_items(screens + old_screens, goal_text)[:limit]
+        filtered_routes = rank_navigation_items(routes, goal_text)[:limit]
+        recommended_steps: list[str] = []
+        for route_payload in filtered_routes:
+            steps = normalize_string_list(route_payload.get("steps"))
+            if route_payload.get("goal"):
+                recommended_steps.append(f"Objetivo: {route_payload.get('goal')}")
+            recommended_steps.extend(steps)
+            if len(recommended_steps) >= limit:
+                break
+
+        useful_actions: list[str] = normalize_string_list(project_navigation.get("knownActions"))
+        warnings: list[str] = normalize_string_list(project_navigation.get("blockers"))[:limit]
+        known_screens: list[dict[str, Any]] = []
+        for screen in filtered_screens:
+            useful_actions = merge_unique_strings(useful_actions, normalize_string_list(screen.get("usefulActions")))
+            warnings = merge_unique_strings(warnings, normalize_string_list(screen.get("blockers")))
+            known_screens.append(
+                {
+                    "screenName": screen.get("screenName"),
+                    "goals": normalize_string_list(screen.get("goals"))[:3],
+                    "visualCues": normalize_string_list(screen.get("visualCues"))[:3],
+                    "assertions": normalize_string_list(screen.get("assertions"))[:3],
+                    "confidence": screen.get("confidence"),
+                }
+            )
+
+        summary = "Nenhum aprendizado de navegacao salvo ainda."
+        if known_screens or recommended_steps or useful_actions:
+            summary_parts = []
+            if goal_text:
+                summary_parts.append(f"Contexto para objetivo: {goal_text}.")
+            summary_parts.append(f"{len(known_screens)} tela(s) conhecida(s), {len(filtered_routes)} rota(s) relevante(s).")
+            summary = " ".join(summary_parts)
+
+        return {
+            "success": True,
+            "summary": summary,
+            "goal": goal_text,
+            "recommendedSteps": recommended_steps[:limit],
+            "knownScreens": known_screens[:limit],
+            "usefulActions": useful_actions[:limit],
+            "warnings": warnings[:limit],
+            "recentEvents": events,
+            "sourcePath": str(self.path.resolve()),
+            "navigationMemoryPath": str(self.path.resolve()),
+        }
+
     def record_automatic_event(self, *, action: str, result: dict[str, Any]) -> None:
         if action not in NAVIGATION_EVENT_ACTIONS:
             return
@@ -268,12 +446,17 @@ class NavigationMemory:
             events = guide.setdefault("recentEvents", [])
             events.append(event)
             guide["recentEvents"] = events[-200:]
+            project_navigation = self._project_navigation(guide)
+            project_events = project_navigation.setdefault("recentEvents", [])
+            project_events.append(event)
+            project_navigation["recentEvents"] = project_events[-200:]
+            project_navigation["updatedAt"] = now
             guide["updatedAt"] = now
             self._write_unlocked(guide)
 
     def _read_unlocked(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {"version": 1, "updatedAt": None, "apps": {}, "recentEvents": []}
+            return self._empty_guide()
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
@@ -284,7 +467,60 @@ class NavigationMemory:
         payload.setdefault("updatedAt", None)
         payload.setdefault("apps", {})
         payload.setdefault("recentEvents", [])
+        self._project_navigation(payload)
         return payload
+
+    @staticmethod
+    def _empty_guide() -> dict[str, Any]:
+        return {
+            "version": 2,
+            "updatedAt": None,
+            "apps": {},
+            "recentEvents": [],
+            "projectNavigation": {
+                "screens": {},
+                "routes": {},
+                "knownActions": [],
+                "blockers": [],
+                "recentEvents": [],
+                "updatedAt": None,
+            },
+        }
+
+    @staticmethod
+    def _project_navigation(guide: dict[str, Any]) -> dict[str, Any]:
+        project_navigation = guide.setdefault("projectNavigation", {})
+        if not isinstance(project_navigation, dict):
+            project_navigation = {}
+            guide["projectNavigation"] = project_navigation
+        for key in ("screens", "routes"):
+            if not isinstance(project_navigation.get(key), dict):
+                project_navigation[key] = {}
+        for key in ("knownActions", "blockers", "recentEvents"):
+            if not isinstance(project_navigation.get(key), list):
+                project_navigation[key] = []
+        project_navigation.setdefault("updatedAt", None)
+        return project_navigation
+
+    @staticmethod
+    def _legacy_screens(guide: dict[str, Any]) -> list[dict[str, Any]]:
+        screens: list[dict[str, Any]] = []
+        apps = guide.get("apps")
+        if not isinstance(apps, dict):
+            return screens
+        for app_package, app_payload in apps.items():
+            if not isinstance(app_payload, dict):
+                continue
+            app_screens = app_payload.get("screens")
+            if not isinstance(app_screens, dict):
+                continue
+            for screen in app_screens.values():
+                if not isinstance(screen, dict):
+                    continue
+                copied = dict(screen)
+                copied["packages"] = merge_unique_strings(copied.get("packages"), [str(app_package)])
+                screens.append(copied)
+        return screens
 
     def _write_unlocked(self, payload: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,6 +542,49 @@ def merge_unique_strings(existing: Any, incoming: list[str]) -> list[str]:
         if isinstance(item, str) and item.strip() and item.strip() not in values:
             values.append(item.strip())
     return values
+
+
+def normalize_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = [str(value)]
+    normalized: list[str] = []
+    for item in values:
+        if not isinstance(item, str):
+            item = str(item)
+        text = item.strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def navigation_search_blob(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for value in item.values():
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, list):
+            parts.extend(str(entry) for entry in value)
+    return " ".join(parts).lower()
+
+
+def rank_navigation_items(items: list[dict[str, Any]], goal: str) -> list[dict[str, Any]]:
+    if not goal.strip():
+        return sorted(items, key=lambda item: int(item.get("updatedAt") or 0), reverse=True)
+    terms = [term for term in re.split(r"\s+", goal.lower()) if term]
+
+    def score(item: dict[str, Any]) -> tuple[int, int]:
+        blob = navigation_search_blob(item)
+        matches = sum(1 for term in terms if term in blob)
+        return matches, int(item.get("updatedAt") or 0)
+
+    ranked = [item for item in items if score(item)[0] > 0]
+    return sorted(ranked, key=score, reverse=True)
 
 
 def sanitize_filename(value: str) -> str:
@@ -457,6 +736,9 @@ class ServerRuntime:
     def navigation_guide(self) -> dict[str, Any]:
         return {"success": True, "navigationMemoryPath": str(self.navigation_memory.path.resolve()), "guide": self.navigation_memory.read()}
 
+    def navigation_context(self, goal: str = "", max_items: int = 8) -> dict[str, Any]:
+        return self.navigation_memory.context(goal=goal, max_items=max_items)
+
     def save_navigation_note(
         self,
         *,
@@ -476,6 +758,33 @@ class ServerRuntime:
             visual_cues=visual_cues,
             useful_actions=useful_actions,
             notes=notes,
+        )
+
+    def save_navigation_learning(
+        self,
+        *,
+        screen_name: str = "",
+        goal: str = "",
+        route: list[str] | None = None,
+        visual_cues: list[str] | None = None,
+        useful_actions: list[str] | None = None,
+        assertions: list[str] | None = None,
+        blockers: list[str] | None = None,
+        notes: str = "",
+        confidence: float = 0.7,
+        app_package: str = "",
+    ) -> dict[str, Any]:
+        return self.navigation_memory.save_learning(
+            screen_name=screen_name,
+            goal=goal,
+            route=route,
+            visual_cues=visual_cues,
+            useful_actions=useful_actions,
+            assertions=assertions,
+            blockers=blockers,
+            notes=notes,
+            confidence=confidence,
+            app_package=app_package,
         )
 
     def adb_status(self) -> dict[str, Any]:
@@ -837,6 +1146,10 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
     def android_navigation_guide() -> dict[str, Any]:
         return runtime.navigation_guide()
 
+    @mcp.tool(name="android_navigation_context", description="Retorna um contexto curto e acionavel para orientar o CLI durante testes.", annotations=read_only)
+    def android_navigation_context(goal: str = "", max_items: int = 8) -> dict[str, Any]:
+        return runtime.navigation_context(goal=goal, max_items=max_items)
+
     @mcp.tool(name="android_save_navigation_note", description="Salva uma orientacao de menu/tela para facilitar testes futuros do app.", annotations=stateful)
     def android_save_navigation_note(
         app_package: str,
@@ -855,6 +1168,32 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
             visual_cues=visual_cues,
             useful_actions=useful_actions,
             notes=notes,
+        )
+
+    @mcp.tool(name="android_save_navigation_learning", description="Salva aprendizado estruturado de navegacao do projeto ativo.", annotations=stateful)
+    def android_save_navigation_learning(
+        screen_name: str = "",
+        goal: str = "",
+        route: list[str] | None = None,
+        visual_cues: list[str] | None = None,
+        useful_actions: list[str] | None = None,
+        assertions: list[str] | None = None,
+        blockers: list[str] | None = None,
+        notes: str = "",
+        confidence: float = 0.7,
+        app_package: str = "",
+    ) -> dict[str, Any]:
+        return runtime.save_navigation_learning(
+            screen_name=screen_name,
+            goal=goal,
+            route=route,
+            visual_cues=visual_cues,
+            useful_actions=useful_actions,
+            assertions=assertions,
+            blockers=blockers,
+            notes=notes,
+            confidence=confidence,
+            app_package=app_package,
         )
 
     @mcp.tool(name="android_get_screen", description="Captura a tela atual via ADB screencap e salva a imagem em tests/mcp.", annotations=read_only)

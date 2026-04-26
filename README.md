@@ -228,7 +228,9 @@ Exemplo de entrada para a tool:
 - `android_adb_autodetect`
 - `android_set_adb_config`
 - `android_navigation_guide`
+- `android_navigation_context`
 - `android_save_navigation_note`
+- `android_save_navigation_learning`
 - `android_get_screen`
 - `android_list_apps`
 - `android_app_info`
@@ -256,9 +258,64 @@ Exemplo de entrada para a tool:
 5. Abra o app com `android_open_app` ou `android_adb_open_app`.
 6. Use `android_get_screen`, `android_tap`, `android_swipe`, `android_input_text`, `android_back`, `android_home` e `android_scroll`.
 7. Execute `android_detect_known_issues` ao final.
-8. Salve notas reutilizáveis de navegação com `android_save_navigation_note`.
+8. Consulte `android_navigation_context` antes de navegar para reutilizar aprendizado do projeto.
+9. Salve notas reutilizáveis de navegação com `android_save_navigation_note` ou `android_save_navigation_learning`.
 
 `android_get_screen` grava screenshots em `<projeto-ativo>/tests/mcp/<timestamp>/artifacts`. Logs de comandos são gravados em `<projeto-ativo>/tests/mcp/<timestamp>/commands`. A memória de navegação fica em `<projeto-ativo>/tests/mcp/navigation/navigation-guide.json`, salvo override.
+
+## Aprendizado de Navegação
+
+O DroidPilot mantém uma memória de navegação no projeto ativo para dar contexto ao CLI durante testes futuros. A memória combina eventos automáticos, como screenshots, taps e abertura de apps, com aprendizados salvos explicitamente pelo agente.
+
+Antes de iniciar um teste ou navegar para uma tela conhecida, consulte:
+
+```json
+{
+  "goal": "abrir tela de configurações",
+  "max_items": 8
+}
+```
+
+na tool `android_navigation_context`. Ela retorna:
+
+- `summary`: resumo curto do que já se sabe
+- `recommendedSteps`: passos reutilizáveis
+- `knownScreens`: telas conhecidas e pistas visuais
+- `usefulActions`: ações úteis já aprendidas
+- `warnings`: bloqueios ou cuidados conhecidos
+- `recentEvents`: eventos recentes da automação
+
+Depois de descobrir uma tela, rota ou comportamento importante, salve o aprendizado com `android_save_navigation_learning`:
+
+```json
+{
+  "screen_name": "Configurações",
+  "goal": "alterar preferências do usuário",
+  "route": [
+    "Abrir o app",
+    "Tocar no ícone de engrenagem no topo",
+    "Aguardar o título Configurações"
+  ],
+  "visual_cues": [
+    "Título Configurações no topo",
+    "Lista com Preferências e Conta"
+  ],
+  "useful_actions": [
+    "Tocar em Conta para dados do usuário",
+    "Pressionar Back para voltar à Home"
+  ],
+  "assertions": [
+    "A tela deve exibir o título Configurações"
+  ],
+  "blockers": [
+    "Se houver diálogo de permissão, aceitar antes de tocar na engrenagem"
+  ],
+  "notes": "A engrenagem pode ficar no canto superior direito em telas pequenas.",
+  "confidence": 0.8
+}
+```
+
+`android_navigation_guide` continua disponível para retornar o JSON completo da memória. `android_save_navigation_note` continua funcionando para compatibilidade com o formato antigo por `app_package`.
 
 ## Testes de Estabilidade com Logcat
 

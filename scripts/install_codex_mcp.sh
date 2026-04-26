@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MCP_NAME="androidAgent"
+MCP_NAME="DroidPilot-MCP"
 PYTHON_CMD="${PYTHON_CMD:-python3}"
 CODEX_CMD="${CODEX_CMD:-codex}"
 FORCE=0
@@ -12,7 +12,7 @@ Uso:
   ./scripts/install_codex_mcp.sh [opcoes]
 
 Opcoes:
-  --name NAME              Nome do servidor MCP no Codex. Padrao: androidAgent
+  --name NAME              Nome do servidor MCP no Codex. Padrao: DroidPilot-MCP
   --python CMD             Python usado para criar o venv. Padrao: python3
   --codex CMD              Binario do Codex CLI. Padrao: codex
   --force                  Remove registro MCP existente antes de registrar novamente

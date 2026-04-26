@@ -58,7 +58,7 @@ Windows PowerShell:
 
 Opções úteis:
 
-- `--name NAME`: nome do servidor MCP no Codex. Padrão: `androidAgent`
+- `--name NAME`: nome do servidor MCP no Codex. Padrão: `DroidPilot-MCP`
 - `--python CMD`: Python usado para criar o venv. Padrão: `python3`
 - `--codex CMD`: binário do Codex CLI. Padrão: `codex`
 - `--force`: recria o registro MCP existente
@@ -144,14 +144,14 @@ Para recriar um registro existente:
 Registro manual:
 
 ```bash
-codex mcp add androidAgent -- /abs/path/DroidPilot-MCP/.venv/bin/python /abs/path/DroidPilot-MCP/droidpilot_mcp_server.py
+codex mcp add DroidPilot-MCP -- /abs/path/DroidPilot-MCP/.venv/bin/python /abs/path/DroidPilot-MCP/droidpilot_mcp_server.py
 ```
 
 Verificação:
 
 ```bash
 codex mcp list
-codex mcp get androidAgent
+codex mcp get DroidPilot-MCP
 ```
 
 ## Instalação no Cursor
@@ -161,7 +161,7 @@ Crie `.cursor/mcp.json` em um projeto, ou `~/.cursor/mcp.json` para uso global:
 ```json
 {
   "mcpServers": {
-    "androidAgent": {
+    "DroidPilot-MCP": {
       "type": "stdio",
       "command": "/abs/path/DroidPilot-MCP/.venv/bin/python",
       "args": [
@@ -175,14 +175,14 @@ Crie `.cursor/mcp.json` em um projeto, ou `~/.cursor/mcp.json` para uso global:
 Depois reinicie o Cursor e liste as tools:
 
 ```bash
-cursor-agent mcp list-tools androidAgent
+cursor-agent mcp list-tools DroidPilot-MCP
 ```
 
 ## Instalação no Claude Code
 
 ```bash
 claude mcp add --transport stdio \
-  androidAgent \
+  DroidPilot-MCP \
   -- /abs/path/DroidPilot-MCP/.venv/bin/python /abs/path/DroidPilot-MCP/droidpilot_mcp_server.py
 ```
 
@@ -202,7 +202,7 @@ Verificação:
 
 ```bash
 claude mcp list
-claude mcp get androidAgent
+claude mcp get DroidPilot-MCP
 ```
 
 ## Tools de Configuração ADB

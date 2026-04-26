@@ -3,7 +3,7 @@ param(
   [string]$Repo = $(if ($env:DROIDPILOT_REPO_URL) { $env:DROIDPILOT_REPO_URL } else { "https://github.com/ronaldomafra/DroidPilot-MCP.git" }),
   [string]$Branch = $(if ($env:DROIDPILOT_BRANCH) { $env:DROIDPILOT_BRANCH } else { "main" }),
   [switch]$SkipUpdate,
-  [string]$Name = "androidAgent",
+  [string]$Name = "DroidPilot-MCP",
   [string]$Python = $(if ($env:PYTHON_CMD) { $env:PYTHON_CMD } elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" } else { "python" }),
   [string]$Codex = $(if ($env:CODEX_CMD) { $env:CODEX_CMD } else { "codex" }),
   [switch]$Force,
@@ -24,7 +24,7 @@ Opcoes:
   -Repo URL                Repositorio Git. Padrao: https://github.com/ronaldomafra/DroidPilot-MCP.git
   -Branch NAME             Branch/tag para instalar. Padrao: main
   -SkipUpdate              Nao atualiza o checkout se o diretorio ja existir
-  -Name NAME               Nome do servidor MCP no Codex. Padrao: androidAgent
+  -Name NAME               Nome do servidor MCP no Codex. Padrao: DroidPilot-MCP
   -Python CMD              Python usado para criar o venv. Padrao: py, se existir; senao python
   -Codex CMD               Binario do Codex CLI. Padrao: codex
   -Force                   Recria registro MCP existente

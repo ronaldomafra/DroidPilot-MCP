@@ -127,6 +127,7 @@ echo "Registrando MCP no Codex: $MCP_NAME"
 
 echo "Instalacao concluida."
 echo "O servidor tenta autodetectar adb no startup."
-echo "Opcionalmente configure adbPath e adbDeviceSerial em android-agent.config.json ou pela tool android_set_adb_config."
+echo "Opcionalmente configure adbPath e adbDeviceSerial no android-agent.config.json do projeto que carrega o MCP."
+echo "A tool android_set_adb_config cria/atualiza esse arquivo no projeto ativo por padrao."
 echo "Verifique com:"
 echo "  $CODEX_CMD mcp get $MCP_NAME"

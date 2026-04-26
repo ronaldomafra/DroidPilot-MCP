@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 
-ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_ARTIFACTS_DIR = ROOT_DIR / "tests" / "mcp"
-DEFAULT_CONFIG_PATH = ROOT_DIR / "android-agent.config.json"
+PROJECT_DIR = Path.cwd().resolve()
+DEFAULT_ARTIFACTS_DIR = PROJECT_DIR / "tests" / "mcp"
+DEFAULT_CONFIG_PATH = PROJECT_DIR / "android-agent.config.json"
 DEFAULT_NAVIGATION_MEMORY_PATH = DEFAULT_ARTIFACTS_DIR / "navigation" / "navigation-guide.json"
 DEFAULT_TIMEOUT_SECONDS = 12.0
 DEFAULT_SCREENSHOT_TIMEOUT_SECONDS = 30.0
@@ -963,7 +963,7 @@ def first_float(*values: Any, default: float) -> float:
 
 def relative_or_absolute_path(path: Path) -> str:
     try:
-        return str(path.relative_to(ROOT_DIR))
+        return str(path.relative_to(PROJECT_DIR))
     except ValueError:
         return str(path)
 
@@ -974,7 +974,7 @@ def resolve_project_path(value: str | None, default: Path) -> Path:
     candidate = Path(value).expanduser()
     if candidate.is_absolute():
         return candidate
-    return ROOT_DIR / candidate
+    return PROJECT_DIR / candidate
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

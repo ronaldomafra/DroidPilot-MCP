@@ -12,7 +12,7 @@ The server runs over MCP `stdio` by default and does not require a companion And
 
 ## Python Setup
 
-From this repository root:
+From the DroidPilot MCP repository root:
 
 ```bash
 python3 -m venv .venv
@@ -32,12 +32,20 @@ py -3 -m venv .venv
 
 ## Local Configuration
 
+The server reads local configuration from the project that starts the MCP process, not from the DroidPilot MCP installation directory. By default it uses:
+
+```text
+<active-project>/android-agent.config.json
+```
+
+The versioned `android-agent.config.example.json` file stays in the DroidPilot MCP repository as a template. Copy it into each project that loads the MCP, or let `android_set_adb_config` create `android-agent.config.json` in the active project.
+
 The server tries to autodetect `adb` on startup using `PATH` and common Android SDK locations. If it cannot find `adb`, it logs a warning and the MCP tools `android_adb_autodetect` and `android_set_adb_config` can be used to inspect or set the path.
 
 Optional local config:
 
 ```bash
-cp android-agent.config.example.json android-agent.config.json
+cp /abs/path/DroidPilot-MCP/android-agent.config.example.json ./android-agent.config.json
 ```
 
 Example:
@@ -59,7 +67,7 @@ Configuration precedence:
 3. Environment variables such as `ANDROID_AGENT_ADB_PATH` and `ANDROID_AGENT_ADB_DEVICE_SERIAL`
 4. autodetection
 
-`android-agent.config.json` is intentionally ignored by Git.
+`artifactsDir` and `navigationMemoryPath` are also relative to the active project by default. Add `android-agent.config.json` and `tests/mcp/` to the active project's `.gitignore` if that project is versioned.
 
 ## Install in Codex CLI
 
@@ -118,6 +126,18 @@ cursor-agent mcp list-tools androidAgent
 claude mcp add --transport stdio \
   androidAgent \
   -- /abs/path/DroidPilot-MCP/.venv/bin/python /abs/path/DroidPilot-MCP/android_agent_mcp_server.py
+```
+
+If a client does not launch MCP servers with the target project as its working directory, pass an explicit config path in the MCP args:
+
+```json
+{
+  "args": [
+    "/abs/path/DroidPilot-MCP/android_agent_mcp_server.py",
+    "--config",
+    "/abs/path/your-project/android-agent.config.json"
+  ]
+}
 ```
 
 Verify:
@@ -180,7 +200,7 @@ Example tool inputs:
 7. Run `android_detect_known_issues` at the end.
 8. Save reusable navigation notes with `android_save_navigation_note`.
 
-`android_get_screen` writes screenshots under `tests/mcp/<timestamp>/artifacts`. Command logs are written under `tests/mcp/<timestamp>/commands`. Navigation memory is stored in `tests/mcp/navigation/navigation-guide.json` unless overridden.
+`android_get_screen` writes screenshots under `<active-project>/tests/mcp/<timestamp>/artifacts`. Command logs are written under `<active-project>/tests/mcp/<timestamp>/commands`. Navigation memory is stored in `<active-project>/tests/mcp/navigation/navigation-guide.json` unless overridden.
 
 ## Logcat Stability Checks
 

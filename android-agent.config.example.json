@@ -1,0 +1,7 @@
+{
+  "timeoutSeconds": 12,
+  "adbPath": "/opt/android/platform-tools/adb",
+  "adbDeviceSerial": "",
+  "artifactsDir": "tests/mcp",
+  "navigationMemoryPath": "tests/mcp/navigation/navigation-guide.json"
+}

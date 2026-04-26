@@ -19,6 +19,12 @@ Em Linux, macOS ou Git Bash no Windows:
 curl -fsSL https://raw.githubusercontent.com/ronaldomafra/DroidPilot-MCP/main/scripts/install.sh | bash
 ```
 
+No Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/ronaldomafra/DroidPilot-MCP/main/scripts/install.ps1 | iex
+```
+
 Esse comando:
 
 - baixa ou atualiza o DroidPilot MCP em `~/.droidpilot-mcp`
@@ -32,10 +38,22 @@ Para recriar um registro MCP já existente:
 curl -fsSL https://raw.githubusercontent.com/ronaldomafra/DroidPilot-MCP/main/scripts/install.sh | bash -s -- --force
 ```
 
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ronaldomafra/DroidPilot-MCP/main/scripts/install.ps1))) -Force
+```
+
 Para instalar em outro diretório:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ronaldomafra/DroidPilot-MCP/main/scripts/install.sh | bash -s -- --dir "$HOME/tools/droidpilot-mcp"
+```
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ronaldomafra/DroidPilot-MCP/main/scripts/install.ps1))) -Dir "$env:USERPROFILE\tools\droidpilot-mcp"
 ```
 
 Opções úteis:
@@ -45,6 +63,8 @@ Opções úteis:
 - `--codex CMD`: binário do Codex CLI. Padrão: `codex`
 - `--force`: recria o registro MCP existente
 - `--dir PATH`: diretório onde o DroidPilot MCP será instalado
+
+No PowerShell, use as mesmas opções em formato PowerShell: `-Name`, `-Python`, `-Codex`, `-Force` e `-Dir`.
 
 Depois da instalação, configure o ADB no projeto que vai usar o MCP. O caminho mais simples é chamar a tool `android_set_adb_config`; ela cria `android-agent.config.json` no projeto ativo.
 

@@ -9,8 +9,46 @@ O servidor roda por MCP `stdio` por padrão e não exige app Android complementa
 - Python 3.10+
 - Android platform-tools / `adb`
 - Um dispositivo Android ou emulador visível em `adb devices`
+- Codex CLI, se for registrar o MCP automaticamente no Codex
 
-## Configuração do Python
+## Instalação Rápida no Codex
+
+Em Linux, macOS ou Git Bash no Windows:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ronaldomafra/DroidPilot-MCP/main/scripts/install.sh | bash
+```
+
+Esse comando:
+
+- baixa ou atualiza o DroidPilot MCP em `~/.droidpilot-mcp`
+- cria `.venv`
+- instala `requirements.txt`
+- registra o MCP no Codex apontando para `droidpilot_mcp_server.py`
+
+Para recriar um registro MCP já existente:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ronaldomafra/DroidPilot-MCP/main/scripts/install.sh | bash -s -- --force
+```
+
+Para instalar em outro diretório:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ronaldomafra/DroidPilot-MCP/main/scripts/install.sh | bash -s -- --dir "$HOME/tools/droidpilot-mcp"
+```
+
+Opções úteis:
+
+- `--name NAME`: nome do servidor MCP no Codex. Padrão: `androidAgent`
+- `--python CMD`: Python usado para criar o venv. Padrão: `python3`
+- `--codex CMD`: binário do Codex CLI. Padrão: `codex`
+- `--force`: recria o registro MCP existente
+- `--dir PATH`: diretório onde o DroidPilot MCP será instalado
+
+Depois da instalação, configure o ADB no projeto que vai usar o MCP. O caminho mais simples é chamar a tool `android_set_adb_config`; ela cria `android-agent.config.json` no projeto ativo.
+
+## Instalação Manual
 
 A partir da raiz do repositório DroidPilot MCP:
 
@@ -69,9 +107,9 @@ Precedência de configuração:
 
 `artifactsDir` e `navigationMemoryPath` também são relativos ao projeto ativo por padrão. Se o projeto ativo for versionado, adicione `android-agent.config.json` e `tests/mcp/` ao `.gitignore` dele.
 
-## Instalação no Codex CLI
+## Registro Manual no Codex CLI
 
-Recomendado:
+Se você já clonou o repositório, pode usar o instalador local:
 
 ```bash
 ./scripts/install_codex_mcp.sh

@@ -74,7 +74,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MCP_DIR="$PROJECT_ROOT"
 VENV_DIR="$PROJECT_ROOT/.venv"
-SERVER_FILE="$MCP_DIR/android_agent_mcp_server.py"
+SERVER_FILE="$MCP_DIR/droidpilot_mcp_server.py"
 REQUIREMENTS_FILE="$MCP_DIR/requirements.txt"
 
 if [ ! -f "$SERVER_FILE" ]; then

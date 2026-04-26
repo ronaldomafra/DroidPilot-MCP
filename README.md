@@ -18,7 +18,7 @@ A partir da raiz do repositório DroidPilot MCP:
 python3 -m venv .venv
 ./.venv/bin/python -m pip install --upgrade pip
 ./.venv/bin/python -m pip install -r requirements.txt
-./.venv/bin/python android_agent_mcp_server.py --help
+./.venv/bin/python droidpilot_mcp_server.py --help
 ```
 
 Windows PowerShell:
@@ -27,7 +27,7 @@ Windows PowerShell:
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe android_agent_mcp_server.py --help
+.\.venv\Scripts\python.exe droidpilot_mcp_server.py --help
 ```
 
 ## Configuração Local
@@ -86,7 +86,7 @@ Para recriar um registro existente:
 Registro manual:
 
 ```bash
-codex mcp add androidAgent -- /abs/path/DroidPilot-MCP/.venv/bin/python /abs/path/DroidPilot-MCP/android_agent_mcp_server.py
+codex mcp add androidAgent -- /abs/path/DroidPilot-MCP/.venv/bin/python /abs/path/DroidPilot-MCP/droidpilot_mcp_server.py
 ```
 
 Verificação:
@@ -107,7 +107,7 @@ Crie `.cursor/mcp.json` em um projeto, ou `~/.cursor/mcp.json` para uso global:
       "type": "stdio",
       "command": "/abs/path/DroidPilot-MCP/.venv/bin/python",
       "args": [
-        "/abs/path/DroidPilot-MCP/android_agent_mcp_server.py"
+        "/abs/path/DroidPilot-MCP/droidpilot_mcp_server.py"
       ]
     }
   }
@@ -125,7 +125,7 @@ cursor-agent mcp list-tools androidAgent
 ```bash
 claude mcp add --transport stdio \
   androidAgent \
-  -- /abs/path/DroidPilot-MCP/.venv/bin/python /abs/path/DroidPilot-MCP/android_agent_mcp_server.py
+  -- /abs/path/DroidPilot-MCP/.venv/bin/python /abs/path/DroidPilot-MCP/droidpilot_mcp_server.py
 ```
 
 Se algum cliente MCP não iniciar servidores usando o projeto alvo como diretório de trabalho, passe um caminho de config explícito nos argumentos do MCP:
@@ -133,7 +133,7 @@ Se algum cliente MCP não iniciar servidores usando o projeto alvo como diretór
 ```json
 {
   "args": [
-    "/abs/path/DroidPilot-MCP/android_agent_mcp_server.py",
+    "/abs/path/DroidPilot-MCP/droidpilot_mcp_server.py",
     "--config",
     "/abs/path/seu-projeto/android-agent.config.json"
   ]

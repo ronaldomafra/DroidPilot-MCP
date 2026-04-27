@@ -4,27 +4,37 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 
 PROJECT_DIR = Path.cwd().resolve()
+SERVER_DIR = Path(__file__).resolve().parent
 DEFAULT_ARTIFACTS_DIR = PROJECT_DIR / "tests" / "mcp"
 DEFAULT_CONFIG_PATH = PROJECT_DIR / "android-agent.config.json"
 DEFAULT_NAVIGATION_MEMORY_PATH = DEFAULT_ARTIFACTS_DIR / "navigation" / "navigation-guide.json"
 DEFAULT_TIMEOUT_SECONDS = 12.0
 DEFAULT_SCREENSHOT_TIMEOUT_SECONDS = 30.0
+DEFAULT_UPDATE_REPO_URL = "https://github.com/ronaldomafra/DroidPilot-MCP.git"
+DEFAULT_UPDATE_CHANNEL = "main"
+DEFAULT_SQLITE_MAX_ROWS = 200
+UPDATE_STATE_FILENAME = ".droidpilot-update.json"
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -671,6 +681,186 @@ def adb_escape_text(text: str) -> str:
     return text.replace("%", "%s").replace(" ", "%s")
 
 
+def normalize_bool(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Valor booleano invalido: {value!r}")
+
+
+def normalize_package_name(value: str) -> str | None:
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+", candidate):
+        return None
+    return candidate
+
+
+def read_text_if_exists(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    except UnicodeDecodeError:
+        return path.read_text(encoding="utf-8", errors="replace")
+
+
+def collect_android_package_candidates(project_dir: Path) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen_paths: set[Path] = set()
+
+    def add_candidate(package_name: str, score: int, source: str, path: Path) -> None:
+        normalized = normalize_package_name(package_name)
+        if not normalized:
+            return
+        candidates.append(
+            {
+                "packageName": normalized,
+                "score": score,
+                "source": source,
+                "path": str(path),
+            }
+        )
+
+    def inspect_file(path: Path) -> None:
+        resolved = path.resolve()
+        if resolved in seen_paths or not path.is_file():
+            return
+        seen_paths.add(resolved)
+        text = read_text_if_exists(path)
+        if not text:
+            return
+        path_str = str(path).replace("\\", "/").lower()
+        if path.name in {"build.gradle", "build.gradle.kts"}:
+            base_score = 100 if "/app/" in path_str else 80
+            for match in re.finditer(r"\bapplicationId\s*(?:=)?\s*[\"']([A-Za-z0-9_.]+)[\"']", text):
+                add_candidate(match.group(1), base_score, "applicationId", path)
+            for match in re.finditer(r"\bnamespace\s*(?:=)?\s*[\"']([A-Za-z0-9_.]+)[\"']", text):
+                add_candidate(match.group(1), base_score - 20, "namespace", path)
+        elif path.name == "AndroidManifest.xml":
+            match = re.search(r"<manifest[^>]*\bpackage\s*=\s*[\"']([A-Za-z0-9_.]+)[\"']", text)
+            if match:
+                score = 70 if "/src/main/" in path_str else 60
+                add_candidate(match.group(1), score, "manifest", path)
+
+    preferred_files = [
+        project_dir / "app" / "build.gradle",
+        project_dir / "app" / "build.gradle.kts",
+        project_dir / "app" / "src" / "main" / "AndroidManifest.xml",
+        project_dir / "build.gradle",
+        project_dir / "build.gradle.kts",
+    ]
+    for path in preferred_files:
+        inspect_file(path)
+
+    if not candidates:
+        for pattern in ("build.gradle", "build.gradle.kts", "AndroidManifest.xml"):
+            for path in sorted(project_dir.rglob(pattern))[:24]:
+                inspect_file(path)
+                if len(candidates) >= 12:
+                    break
+            if len(candidates) >= 12:
+                break
+
+    return sorted(candidates, key=lambda item: (int(item["score"]), item["path"]), reverse=True)
+
+
+def infer_android_package_name(project_dir: Path) -> dict[str, Any]:
+    candidates = collect_android_package_candidates(project_dir)
+    best = candidates[0] if candidates else None
+    return {
+        "packageName": best["packageName"] if best else None,
+        "source": best["source"] if best else None,
+        "sourcePath": best["path"] if best else None,
+        "candidates": candidates[:8],
+    }
+
+
+def ensure_safe_database_name(database_name: str) -> str:
+    candidate = Path(database_name.strip()).name
+    if not candidate or candidate in {".", ".."} or "/" in database_name or "\\" in database_name:
+        raise ValueError("database_name deve ser apenas o nome do arquivo do banco")
+    return candidate
+
+
+def classify_sql_statement(sql: str) -> Literal["read", "write"]:
+    normalized = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    normalized = re.sub(r"--.*?$", " ", normalized, flags=re.MULTILINE).strip()
+    keyword = normalized.split(None, 1)[0].upper() if normalized else ""
+    if keyword in {"SELECT", "PRAGMA", "EXPLAIN"}:
+        return "read"
+    if keyword == "WITH" and not re.search(r"\b(INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b", normalized, re.IGNORECASE):
+        return "read"
+    return "write"
+
+
+def json_safe_sqlite_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {"type": "bytes", "hex": value.hex()}
+    return value
+
+
+def should_preserve_update_path(relative: Path) -> bool:
+    if not relative.parts:
+        return True
+    if relative.parts[0] in {".git", ".venv", "__pycache__"}:
+        return True
+    if relative.parts[0] == "tests" and len(relative.parts) > 1 and relative.parts[1] == "mcp":
+        return True
+    if relative.name in {UPDATE_STATE_FILENAME, "android-agent.config.json"}:
+        return True
+    return False
+
+
+def iter_fingerprint_files(root: Path) -> list[Path]:
+    excluded_names = {".git", ".venv", "__pycache__", UPDATE_STATE_FILENAME}
+    files: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if any(part in excluded_names for part in relative.parts):
+            continue
+        if relative.parts[:2] == ("tests", "mcp"):
+            continue
+        if path.suffix in {".pyc", ".pyo"}:
+            continue
+        files.append(path)
+    return files
+
+
+def compute_tree_fingerprint(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in iter_fingerprint_files(root):
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def update_repo_archive_url(repo_url: str, channel: str) -> str | None:
+    normalized = repo_url.strip().removesuffix(".git").rstrip("/")
+    if normalized.startswith("https://github.com/"):
+        return f"{normalized}/archive/refs/heads/{channel}.zip"
+    return None
+
+
+def first_int_match(pattern: str, content: str) -> int | None:
+    match = re.search(pattern, content)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 @dataclass
 class ServerRuntime:
     timeout_seconds: float
@@ -679,14 +869,27 @@ class ServerRuntime:
     config_path: Path
     adb_path: str | None
     adb_device_serial: str | None
+    install_dir: Path
+    configured_package_name: str | None
+    sqlite_root_path: str | None
+    sqlite_root_access_policy: str
+    auto_update_enabled: bool
+    update_repo_url: str
+    update_channel: str
+
+    def __post_init__(self) -> None:
+        self._package_resolution_cache: dict[str, Any] | None = None
+        self._package_meta_cache: dict[str, dict[str, Any]] = {}
+        self._update_status_cache: dict[str, Any] | None = None
 
     def adb_config(self) -> dict[str, Any]:
         detected = self.detect_adb_path()
         configured_exists = bool(self.adb_path and Path(self.adb_path).expanduser().exists())
-        return {
+        payload = {
             "success": True,
             "transport": "adb",
             "configPath": str(self.config_path.resolve()),
+            "installDir": str(self.install_dir.resolve()),
             "timeoutSeconds": self.timeout_seconds,
             "adbPath": self.adb_path,
             "effectiveAdbPath": self.adb_path or detected,
@@ -699,6 +902,10 @@ class ServerRuntime:
             "sessionLogPath": str(self.recorder.paths.session_log.resolve()),
             "navigationMemoryPath": str(self.navigation_memory.path.resolve()),
         }
+        payload["packageResolution"] = self.package_resolution()
+        payload["sqlite"] = self.sqlite_status(include_databases=False, fail_silently=True)
+        payload["autoUpdate"] = self.current_update_status()
+        return payload
 
     def adb_autodetect(self) -> dict[str, Any]:
         detected = self.detect_adb_path()
@@ -726,12 +933,78 @@ class ServerRuntime:
         payload["timeoutSeconds"] = self.timeout_seconds
         payload["adbPath"] = self.adb_path or ""
         payload["adbDeviceSerial"] = self.adb_device_serial or ""
+        payload["packageName"] = self.configured_package_name or ""
+        payload["sqliteRootPath"] = self.sqlite_root_path or ""
+        payload["sqliteRootAccessPolicy"] = self.sqlite_root_access_policy
+        payload["autoUpdateEnabled"] = self.auto_update_enabled
+        payload["updateRepoUrl"] = self.update_repo_url
+        payload["updateChannel"] = self.update_channel
         payload.setdefault("artifactsDir", relative_or_absolute_path(DEFAULT_ARTIFACTS_DIR))
         payload.setdefault("navigationMemoryPath", relative_or_absolute_path(DEFAULT_NAVIGATION_MEMORY_PATH))
         legacy_key = "end" + "point"
         payload.pop(legacy_key, None)
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         self.config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def package_resolution(self, force_refresh: bool = False) -> dict[str, Any]:
+        if self._package_resolution_cache and not force_refresh:
+            return dict(self._package_resolution_cache)
+        inferred = infer_android_package_name(PROJECT_DIR)
+        configured = normalize_package_name(self.configured_package_name or "")
+        package_name = configured or inferred.get("packageName")
+        payload = {
+            "packageName": package_name,
+            "configuredPackageName": configured,
+            "inferredPackageName": inferred.get("packageName"),
+            "source": "config" if configured else inferred.get("source"),
+            "sourcePath": str(self.config_path.resolve()) if configured else inferred.get("sourcePath"),
+            "candidates": inferred.get("candidates", []),
+        }
+        self._package_resolution_cache = payload
+        return dict(payload)
+
+    def resolve_package_name(self) -> str:
+        package_name = self.package_resolution().get("packageName")
+        if package_name:
+            return str(package_name)
+        raise RuntimeError(
+            "Nao foi possivel resolver o packageName do projeto ativo. "
+            "Defina packageName em android-agent.config.json ou use um projeto Android com applicationId detectavel."
+        )
+
+    def sqlite_root_relative_path(self) -> str:
+        value = (self.sqlite_root_path or "databases").replace("\\", "/").strip().strip("/")
+        if not value:
+            return "databases"
+        parts = [part for part in value.split("/") if part]
+        if any(part == ".." for part in parts):
+            raise ValueError("sqliteRootPath invalido")
+        return "/".join(parts)
+
+    def package_meta(self, package_name: str) -> dict[str, Any]:
+        if package_name in self._package_meta_cache:
+            return dict(self._package_meta_cache[package_name])
+        result = self.run_adb_command(
+            command_name="package_meta",
+            adb_args=["shell", "dumpsys", "package", package_name],
+            request_payload={"packageName": package_name},
+            timeout_seconds=max(self.timeout_seconds, 30.0),
+            record_stdout_max_chars=20000,
+        )
+        stdout = str(result.get("stdout") or "")
+        meta = {
+            "packageName": package_name,
+            "installed": package_name in stdout,
+            "debuggable": "DEBUGGABLE" in stdout,
+            "appId": first_int_match(r"\bappId=(\d+)", stdout),
+            "dataDir": None,
+            "commandLogPath": result.get("commandLogPath"),
+        }
+        data_dir_match = re.search(r"\bdataDir=([^\s]+)", stdout)
+        if data_dir_match:
+            meta["dataDir"] = data_dir_match.group(1).strip()
+        self._package_meta_cache[package_name] = meta
+        return dict(meta)
 
     def navigation_guide(self) -> dict[str, Any]:
         return {"success": True, "navigationMemoryPath": str(self.navigation_memory.path.resolve()), "guide": self.navigation_memory.read()}
@@ -791,6 +1064,222 @@ class ServerRuntime:
         payload = self.run_adb_command(command_name="adb_status", adb_args=["devices", "-l"])
         payload["adbConfig"] = self.adb_config()
         return payload
+
+    def sqlite_status(self, include_databases: bool = True, fail_silently: bool = False) -> dict[str, Any]:
+        try:
+            package_name = self.resolve_package_name()
+            package_meta = self.package_meta(package_name)
+            root_relative = self.sqlite_root_relative_path()
+            data_dir = package_meta.get("dataDir") or f"/data/user/0/{package_name}"
+            remote_root = f"{data_dir.rstrip('/')}/{root_relative}"
+            access = self.detect_sqlite_access(package_name, root_relative, remote_root, package_meta=package_meta)
+            payload = {
+                "success": access["canRead"],
+                "packageName": package_name,
+                "rootRelativePath": root_relative,
+                "remoteRootPath": remote_root,
+                "accessPolicy": self.sqlite_root_access_policy,
+                "accessMode": access["accessMode"],
+                "canRead": access["canRead"],
+                "canWrite": access["canWrite"],
+                "installed": package_meta.get("installed"),
+                "debuggable": package_meta.get("debuggable"),
+                "appId": package_meta.get("appId"),
+                "message": access["message"],
+                "attempts": access["attempts"],
+            }
+            if include_databases and access["canRead"]:
+                listing = self.list_remote_sqlite_entries(package_name, access["accessMode"], root_relative, remote_root)
+                payload["entries"] = listing["entries"]
+                payload["databases"] = listing["databases"]
+                payload["companionFiles"] = listing["companionFiles"]
+            return payload
+        except Exception as exc:
+            payload = {
+                "success": False,
+                "message": str(exc),
+                "accessPolicy": self.sqlite_root_access_policy,
+                "accessMode": "unavailable",
+                "canRead": False,
+                "canWrite": False,
+            }
+            if fail_silently:
+                return payload
+            raise RuntimeError(str(exc)) from exc
+
+    def detect_sqlite_access(
+        self,
+        package_name: str,
+        root_relative: str,
+        remote_root: str,
+        *,
+        package_meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        attempts: list[dict[str, Any]] = []
+        policy = self.sqlite_root_access_policy
+        if policy in {"run-as-only", "run-as-then-root"}:
+            result = self.run_adb_command(
+                command_name="sqlite_probe_run_as",
+                adb_args=["shell", "run-as", package_name, "ls", root_relative],
+                request_payload={"packageName": package_name, "rootRelativePath": root_relative, "probeMode": "run-as"},
+                timeout_seconds=max(self.timeout_seconds, 20.0),
+                record_stdout_max_chars=4000,
+            )
+            attempts.append({"mode": "run-as", "success": result["success"], "stderr": result.get("stderr"), "stdout": tail_preview(str(result.get("stdout") or ""), max_lines=20, max_chars=1000)})
+            if result["success"]:
+                return {
+                    "accessMode": "run-as",
+                    "canRead": True,
+                    "canWrite": True,
+                    "message": "SQLite directory accessible via run-as",
+                    "attempts": attempts,
+                }
+        if policy in {"root-only", "run-as-then-root"}:
+            result = self.run_adb_command(
+                command_name="sqlite_probe_root",
+                adb_args=["shell", "su", "-c", f"ls {shlex.quote(remote_root)}"],
+                request_payload={"packageName": package_name, "remoteRootPath": remote_root, "probeMode": "root"},
+                timeout_seconds=max(self.timeout_seconds, 20.0),
+                record_stdout_max_chars=4000,
+            )
+            attempts.append({"mode": "root", "success": result["success"], "stderr": result.get("stderr"), "stdout": tail_preview(str(result.get("stdout") or ""), max_lines=20, max_chars=1000)})
+            if result["success"]:
+                can_write = bool((package_meta or {}).get("appId"))
+                return {
+                    "accessMode": "root",
+                    "canRead": True,
+                    "canWrite": can_write,
+                    "message": "SQLite directory accessible via root",
+                    "attempts": attempts,
+                }
+        return {
+            "accessMode": "unavailable",
+            "canRead": False,
+            "canWrite": False,
+            "message": "Nao foi possivel acessar o diretorio SQLite do app via run-as/root",
+            "attempts": attempts,
+        }
+
+    def list_remote_sqlite_entries(self, package_name: str, access_mode: str, root_relative: str, remote_root: str) -> dict[str, Any]:
+        result = self.run_remote_listing_command(package_name, access_mode, root_relative, remote_root)
+        lines = [line.strip() for line in str(result.get("stdout") or "").splitlines() if line.strip() and not line.lower().startswith("total")]
+        entries = sorted(set(lines))
+        companion_suffixes = ("-wal", "-shm", "-journal")
+        databases = [entry for entry in entries if not entry.endswith(companion_suffixes) and ".bak-" not in entry]
+        companion_files = [entry for entry in entries if entry.endswith(companion_suffixes)]
+        return {
+            "entries": entries,
+            "databases": databases,
+            "companionFiles": companion_files,
+            "commandLogPath": result.get("commandLogPath"),
+        }
+
+    def sqlite_list_databases(self) -> dict[str, Any]:
+        status = self.sqlite_status(include_databases=True)
+        status["message"] = "SQLite databases listed successfully" if status["success"] else status["message"]
+        return status
+
+    def sqlite_pull_database(self, database_name: str) -> dict[str, Any]:
+        database_name = ensure_safe_database_name(database_name)
+        status = self.sqlite_status(include_databases=False)
+        if not status["canRead"]:
+            raise RuntimeError(status["message"])
+        bundle = self.pull_remote_sqlite_bundle(
+            package_name=str(status["packageName"]),
+            access_mode=str(status["accessMode"]),
+            root_relative=str(status["rootRelativePath"]),
+            remote_root=str(status["remoteRootPath"]),
+            database_name=database_name,
+        )
+        return {
+            "success": True,
+            "message": "SQLite database pulled successfully",
+            "packageName": status["packageName"],
+            "accessMode": status["accessMode"],
+            "databaseName": database_name,
+            "artifactDir": str(bundle["artifactDir"].resolve()),
+            "databasePath": str(bundle["databasePath"].resolve()),
+            "paths": [str(path.resolve()) for path in bundle["files"].values()],
+            "files": sorted(bundle["files"].keys()),
+            "remoteRootPath": status["remoteRootPath"],
+        }
+
+    def sqlite_query(self, database_name: str, sql: str, parameters: list[Any] | None = None, max_rows: int = DEFAULT_SQLITE_MAX_ROWS) -> dict[str, Any]:
+        database_name = ensure_safe_database_name(database_name)
+        sql = sql.strip()
+        if not sql:
+            raise ValueError("sql eh obrigatorio")
+        if max_rows < 1:
+            raise ValueError("max_rows deve ser >= 1")
+        status = self.sqlite_status(include_databases=False)
+        if not status["canRead"]:
+            raise RuntimeError(status["message"])
+        statement_kind = classify_sql_statement(sql)
+        if statement_kind == "write" and not status["canWrite"]:
+            raise RuntimeError("O acesso SQLite atual nao permite escrita no app alvo")
+        bundle = self.pull_remote_sqlite_bundle(
+            package_name=str(status["packageName"]),
+            access_mode=str(status["accessMode"]),
+            root_relative=str(status["rootRelativePath"]),
+            remote_root=str(status["remoteRootPath"]),
+            database_name=database_name,
+        )
+        local_backup_dir: Path | None = None
+        if statement_kind == "write":
+            local_backup_dir = self.recorder.paths.artifacts_dir / "sqlite" / f"backup-{int(time.time() * 1000)}"
+            local_backup_dir.mkdir(parents=True, exist_ok=True)
+            for filename, path in bundle["files"].items():
+                shutil.copy2(path, local_backup_dir / filename)
+        connection = sqlite3.connect(str(bundle["databasePath"]))
+        write_back: dict[str, Any] | None = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute(sql, list(parameters or []))
+            columns = [str(item[0]) for item in cursor.description] if cursor.description else []
+            rows_raw = cursor.fetchmany(max_rows + 1) if cursor.description else []
+            rows = [[json_safe_sqlite_value(value) for value in row] for row in rows_raw[:max_rows]]
+            truncated = len(rows_raw) > max_rows
+            affected_rows = cursor.rowcount if cursor.rowcount != -1 else len(rows)
+            if statement_kind == "write":
+                connection.commit()
+                try:
+                    connection.execute("PRAGMA wal_checkpoint(FULL)")
+                except sqlite3.DatabaseError:
+                    pass
+            else:
+                connection.rollback()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        if statement_kind == "write":
+            write_back = self.push_local_sqlite_bundle(
+                package_name=str(status["packageName"]),
+                access_mode=str(status["accessMode"]),
+                root_relative=str(status["rootRelativePath"]),
+                remote_root=str(status["remoteRootPath"]),
+                database_name=database_name,
+                local_dir=bundle["artifactDir"],
+                package_meta=self.package_meta(str(status["packageName"])),
+            )
+        return {
+            "success": True,
+            "message": "SQLite query executed successfully",
+            "packageName": status["packageName"],
+            "databaseName": database_name,
+            "statementKind": statement_kind,
+            "columns": columns,
+            "rows": rows,
+            "rowCount": len(rows),
+            "affectedRows": affected_rows,
+            "truncated": truncated,
+            "maxRows": max_rows,
+            "artifactDir": str(bundle["artifactDir"].resolve()),
+            "databasePath": str(bundle["databasePath"].resolve()),
+            "localBackupDir": str(local_backup_dir.resolve()) if local_backup_dir else None,
+            "writeBack": write_back,
+        }
 
     def get_screen(self, include_base64: bool = False, filename: str | None = None) -> dict[str, Any]:
         artifact_name = safe_artifact_filename(filename, "screen", ".png") if filename else "screen.png"
@@ -984,6 +1473,266 @@ class ServerRuntime:
         logcat_path.write_text(content, encoding="utf-8", errors="replace")
         return logcat_path
 
+    def current_update_status(self) -> dict[str, Any]:
+        if self._update_status_cache is not None:
+            return dict(self._update_status_cache)
+        install_mode = self.detect_install_mode()
+        state = self.load_update_state()
+        payload = {
+            "enabled": self.auto_update_enabled,
+            "installMode": install_mode,
+            "repoUrl": self.update_repo_url,
+            "channel": self.update_channel,
+            "checkedAt": state.get("checkedAt"),
+            "currentRevision": state.get("currentRevision"),
+            "targetRevision": state.get("targetRevision"),
+            "updateApplied": bool(state.get("updateApplied", False)),
+            "restartRequired": bool(state.get("restartRequired", False)),
+            "message": state.get("message", "Auto-update not checked in this session"),
+            "lastError": state.get("lastError"),
+        }
+        self._update_status_cache = payload
+        return dict(payload)
+
+    def load_update_state(self) -> dict[str, Any]:
+        path = self.install_dir / UPDATE_STATE_FILENAME
+        if not path.exists():
+            return {}
+        return load_json_config(path)
+
+    def save_update_state(self, payload: dict[str, Any]) -> None:
+        path = self.install_dir / UPDATE_STATE_FILENAME
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._update_status_cache = dict(payload)
+
+    def detect_install_mode(self) -> str:
+        return "git" if (self.install_dir / ".git").exists() else "archive"
+
+    def update_venv_python(self) -> Path:
+        if os.name == "nt":
+            return self.install_dir / ".venv" / "Scripts" / "python.exe"
+        return self.install_dir / ".venv" / "bin" / "python"
+
+    def startup_auto_update(self) -> dict[str, Any]:
+        install_mode = self.detect_install_mode()
+        base_status = {
+            "enabled": self.auto_update_enabled,
+            "installMode": install_mode,
+            "repoUrl": self.update_repo_url,
+            "channel": self.update_channel,
+            "checkedAt": int(time.time() * 1000),
+            "currentRevision": None,
+            "targetRevision": None,
+            "updateApplied": False,
+            "restartRequired": False,
+            "message": "Auto-update disabled",
+            "lastError": None,
+        }
+        if not self.auto_update_enabled:
+            base_status["currentRevision"] = self.local_install_revision(install_mode)
+            self.save_update_state(base_status)
+            return base_status
+        try:
+            if install_mode == "git":
+                status = self.update_git_install()
+            else:
+                status = self.update_archive_install()
+        except Exception as exc:
+            base_status["message"] = "Auto-update failed"
+            base_status["lastError"] = str(exc)
+            base_status["currentRevision"] = self.local_install_revision(install_mode)
+            self.save_update_state(base_status)
+            LOGGER.warning("Auto-update failed: %s", exc)
+            return base_status
+        self.save_update_state(status)
+        if status.get("updateApplied"):
+            LOGGER.warning("DroidPilot MCP updated on disk. Restart the MCP client to load the new version.")
+        return status
+
+    def local_install_revision(self, install_mode: str | None = None) -> str | None:
+        mode = install_mode or self.detect_install_mode()
+        if mode == "git":
+            try:
+                result = self.run_host_command("update_git_head", ["git", "-C", str(self.install_dir), "rev-parse", "HEAD"], timeout_seconds=max(self.timeout_seconds, 30.0))
+            except Exception:
+                return None
+            if result["success"]:
+                return str(result.get("stdout") or "").strip() or None
+            return None
+        return compute_tree_fingerprint(self.install_dir)
+
+    def update_git_install(self) -> dict[str, Any]:
+        before = self.local_install_revision("git")
+        dirty = self.run_host_command("update_git_status", ["git", "-C", str(self.install_dir), "status", "--porcelain"], timeout_seconds=max(self.timeout_seconds, 30.0))
+        if str(dirty.get("stdout") or "").strip():
+            return {
+                "enabled": True,
+                "installMode": "git",
+                "repoUrl": self.update_repo_url,
+                "channel": self.update_channel,
+                "checkedAt": int(time.time() * 1000),
+                "currentRevision": before,
+                "targetRevision": before,
+                "updateApplied": False,
+                "restartRequired": False,
+                "message": "Auto-update skipped because the installation has local changes",
+                "lastError": None,
+            }
+        self.run_host_command("update_git_remote", ["git", "-C", str(self.install_dir), "remote", "set-url", "origin", self.update_repo_url], timeout_seconds=max(self.timeout_seconds, 30.0))
+        fetch = self.run_host_command("update_git_fetch", ["git", "-C", str(self.install_dir), "fetch", "origin", self.update_channel], timeout_seconds=max(self.timeout_seconds, 90.0))
+        if not fetch["success"]:
+            raise RuntimeError(fetch.get("stderr") or fetch.get("stdout") or "git fetch failed")
+        target = self.run_host_command(
+            "update_git_target",
+            ["git", "-C", str(self.install_dir), "rev-parse", f"origin/{self.update_channel}"],
+            timeout_seconds=max(self.timeout_seconds, 30.0),
+        )
+        target_revision = str(target.get("stdout") or "").strip() or None
+        if before and target_revision and before == target_revision:
+            return {
+                "enabled": True,
+                "installMode": "git",
+                "repoUrl": self.update_repo_url,
+                "channel": self.update_channel,
+                "checkedAt": int(time.time() * 1000),
+                "currentRevision": before,
+                "targetRevision": target_revision,
+                "updateApplied": False,
+                "restartRequired": False,
+                "message": "Installation already up to date",
+                "lastError": None,
+            }
+        checkout = self.run_host_command(
+            "update_git_checkout",
+            ["git", "-C", str(self.install_dir), "checkout", self.update_channel],
+            timeout_seconds=max(self.timeout_seconds, 60.0),
+        )
+        if not checkout["success"]:
+            fallback_checkout = self.run_host_command(
+                "update_git_checkout_branch",
+                ["git", "-C", str(self.install_dir), "checkout", "-B", self.update_channel, f"origin/{self.update_channel}"],
+                timeout_seconds=max(self.timeout_seconds, 60.0),
+            )
+            if not fallback_checkout["success"]:
+                raise RuntimeError(fallback_checkout.get("stderr") or fallback_checkout.get("stdout") or "git checkout failed")
+        pull = self.run_host_command(
+            "update_git_pull",
+            ["git", "-C", str(self.install_dir), "pull", "--ff-only", "origin", self.update_channel],
+            timeout_seconds=max(self.timeout_seconds, 120.0),
+        )
+        if not pull["success"]:
+            raise RuntimeError(pull.get("stderr") or pull.get("stdout") or "git pull failed")
+        after = self.local_install_revision("git")
+        changed = bool(before != after)
+        dependency_status = self.reinstall_requirements_if_needed(changed)
+        return {
+            "enabled": True,
+            "installMode": "git",
+            "repoUrl": self.update_repo_url,
+            "channel": self.update_channel,
+            "checkedAt": int(time.time() * 1000),
+            "currentRevision": after,
+            "targetRevision": target_revision or after,
+            "updateApplied": changed,
+            "restartRequired": changed,
+            "message": "Git installation updated" if changed else "Installation already up to date",
+            "lastError": None,
+            "dependencyUpdate": dependency_status,
+        }
+
+    def update_archive_install(self) -> dict[str, Any]:
+        archive_url = update_repo_archive_url(self.update_repo_url, self.update_channel)
+        if not archive_url:
+            raise RuntimeError("Auto-update por archive atualmente suporta apenas repositorios GitHub")
+        local_revision = self.local_install_revision("archive")
+        with tempfile.TemporaryDirectory(prefix="droidpilot-update-") as temp_dir_value:
+            temp_dir = Path(temp_dir_value)
+            archive_path = temp_dir / "droidpilot.zip"
+            with urllib.request.urlopen(archive_url, timeout=max(int(self.timeout_seconds), 20)) as response:
+                archive_path.write_bytes(response.read())
+            with zipfile.ZipFile(archive_path) as archive:
+                archive.extractall(temp_dir)
+            extracted_dirs = [path for path in temp_dir.iterdir() if path.is_dir()]
+            if not extracted_dirs:
+                raise RuntimeError("Arquivo de update nao contem um diretorio de projeto valido")
+            source_dir = extracted_dirs[0]
+            target_revision = compute_tree_fingerprint(source_dir)
+            if local_revision == target_revision:
+                return {
+                    "enabled": True,
+                    "installMode": "archive",
+                    "repoUrl": self.update_repo_url,
+                    "channel": self.update_channel,
+                    "checkedAt": int(time.time() * 1000),
+                    "currentRevision": local_revision,
+                    "targetRevision": target_revision,
+                    "updateApplied": False,
+                    "restartRequired": False,
+                    "message": "Installation already up to date",
+                    "lastError": None,
+                }
+            self.sync_install_tree(source_dir, self.install_dir)
+        current_revision = self.local_install_revision("archive")
+        dependency_status = self.reinstall_requirements_if_needed(True)
+        return {
+            "enabled": True,
+            "installMode": "archive",
+            "repoUrl": self.update_repo_url,
+            "channel": self.update_channel,
+            "checkedAt": int(time.time() * 1000),
+            "currentRevision": current_revision,
+            "targetRevision": current_revision,
+            "updateApplied": True,
+            "restartRequired": True,
+            "message": "Archive installation updated",
+            "lastError": None,
+            "dependencyUpdate": dependency_status,
+        }
+
+    def sync_install_tree(self, source_dir: Path, target_dir: Path) -> None:
+        for target_path in sorted(target_dir.rglob("*"), reverse=True):
+            relative = target_path.relative_to(target_dir)
+            if should_preserve_update_path(relative):
+                continue
+            if not (source_dir / relative).exists():
+                if target_path.is_file():
+                    target_path.unlink()
+                elif target_path.is_dir():
+                    try:
+                        target_path.rmdir()
+                    except OSError:
+                        pass
+        for source_path in sorted(source_dir.rglob("*")):
+            relative = source_path.relative_to(source_dir)
+            if should_preserve_update_path(relative):
+                continue
+            destination = target_dir / relative
+            if source_path.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, destination)
+
+    def reinstall_requirements_if_needed(self, installation_changed: bool) -> dict[str, Any]:
+        if not installation_changed:
+            return {"success": True, "skipped": True, "message": "Dependency refresh not required"}
+        venv_python = self.update_venv_python()
+        requirements_file = self.install_dir / "requirements.txt"
+        if not venv_python.exists() or not requirements_file.exists():
+            return {"success": False, "skipped": True, "message": "Venv or requirements not found"}
+        result = self.run_host_command(
+            "update_requirements",
+            [str(venv_python), "-m", "pip", "install", "-r", str(requirements_file)],
+            timeout_seconds=max(self.timeout_seconds, 180.0),
+        )
+        return {
+            "success": result["success"],
+            "skipped": False,
+            "message": "Dependencies updated" if result["success"] else "Dependency update failed",
+            "commandLogPath": result.get("commandLogPath"),
+            "stderr": result.get("stderr"),
+        }
+
     def detect_adb_path(self) -> str | None:
         if self.adb_path:
             candidate = Path(self.adb_path).expanduser()
@@ -1021,6 +1770,310 @@ class ServerRuntime:
             "ou instale Android platform-tools no PATH."
         )
 
+    def run_host_command(
+        self,
+        command_name: str,
+        argv: list[str],
+        *,
+        timeout_seconds: float | None = None,
+        cwd: Path | None = None,
+    ) -> dict[str, Any]:
+        request = {
+            "transport": "local-process",
+            "argv": argv,
+            "shellCommand": " ".join(shlex.quote(part) for part in argv),
+            "cwd": str((cwd or self.install_dir).resolve()),
+        }
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=str((cwd or self.install_dir).resolve()),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds or self.timeout_seconds,
+                check=False,
+            )
+            response = {
+                "transport": "local-process",
+                "success": completed.returncode == 0,
+                "returnCode": completed.returncode,
+                "stdout": str(completed.stdout).strip(),
+                "stderr": str(completed.stderr).strip(),
+                "argv": argv,
+                "timestamp": int(time.time() * 1000),
+            }
+            command_path = self.recorder.record_command(command_name=command_name, request_payload=request, response_payload=response)
+            return {
+                "success": response["success"],
+                "message": "Local command executed" if response["success"] else "Local command failed",
+                "commandLogPath": str(command_path.resolve()),
+                "request": {"action": command_name},
+                **response,
+            }
+        except Exception as exc:
+            command_path = self.recorder.record_command(command_name=command_name, request_payload=request, error_message=str(exc))
+            raise RuntimeError(f"{exc} (detalhes: {command_path})") from exc
+
+    def run_remote_listing_command(self, package_name: str, access_mode: str, root_relative: str, remote_root: str) -> dict[str, Any]:
+        if access_mode == "run-as":
+            return self.run_adb_command(
+                command_name="sqlite_list_dir_run_as",
+                adb_args=["shell", "run-as", package_name, "ls", "-1", root_relative],
+                request_payload={"packageName": package_name, "rootRelativePath": root_relative, "accessMode": access_mode},
+                timeout_seconds=max(self.timeout_seconds, 20.0),
+                record_stdout_max_chars=8000,
+            )
+        if access_mode == "root":
+            return self.run_adb_command(
+                command_name="sqlite_list_dir_root",
+                adb_args=["shell", "su", "-c", f"ls -1 {shlex.quote(remote_root)}"],
+                request_payload={"packageName": package_name, "remoteRootPath": remote_root, "accessMode": access_mode},
+                timeout_seconds=max(self.timeout_seconds, 20.0),
+                record_stdout_max_chars=8000,
+            )
+        raise RuntimeError("SQLite access mode indisponivel")
+
+    def pull_remote_sqlite_bundle(
+        self,
+        *,
+        package_name: str,
+        access_mode: str,
+        root_relative: str,
+        remote_root: str,
+        database_name: str,
+    ) -> dict[str, Any]:
+        listing = self.list_remote_sqlite_entries(package_name, access_mode, root_relative, remote_root)
+        if database_name not in listing["databases"] and database_name not in listing["entries"]:
+            raise RuntimeError(f"Banco SQLite nao encontrado: {database_name}")
+        artifact_dir = self.recorder.paths.artifacts_dir / "sqlite" / f"{sanitize_filename(database_name)}-{int(time.time() * 1000)}"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        files: dict[str, Path] = {}
+        for filename in [database_name, f"{database_name}-wal", f"{database_name}-shm", f"{database_name}-journal"]:
+            if filename not in listing["entries"]:
+                continue
+            local_path = artifact_dir / filename
+            self.copy_remote_sqlite_file(
+                package_name=package_name,
+                access_mode=access_mode,
+                root_relative=root_relative,
+                remote_root=remote_root,
+                filename=filename,
+                local_path=local_path,
+            )
+            files[filename] = local_path
+        if database_name not in files:
+            raise RuntimeError(f"Nao foi possivel copiar o banco SQLite {database_name}")
+        return {
+            "artifactDir": artifact_dir,
+            "databasePath": files[database_name],
+            "files": files,
+        }
+
+    def copy_remote_sqlite_file(
+        self,
+        *,
+        package_name: str,
+        access_mode: str,
+        root_relative: str,
+        remote_root: str,
+        filename: str,
+        local_path: Path,
+    ) -> None:
+        if access_mode == "run-as":
+            result = self.run_adb_command(
+                command_name="sqlite_pull_file_run_as",
+                adb_args=["exec-out", "run-as", package_name, "cat", f"{root_relative}/{filename}"],
+                request_payload={"packageName": package_name, "filename": filename, "accessMode": access_mode},
+                timeout_seconds=max(self.timeout_seconds, 30.0),
+                decode_stdout=False,
+                artifact_path=local_path,
+            )
+        elif access_mode == "root":
+            result = self.run_adb_command(
+                command_name="sqlite_pull_file_root",
+                adb_args=["exec-out", "su", "-c", f"cat {shlex.quote(f'{remote_root}/{filename}')}"],
+                request_payload={"packageName": package_name, "filename": filename, "accessMode": access_mode},
+                timeout_seconds=max(self.timeout_seconds, 30.0),
+                decode_stdout=False,
+                artifact_path=local_path,
+            )
+        else:
+            raise RuntimeError("SQLite access mode indisponivel")
+        if not result["success"]:
+            raise RuntimeError(result.get("stderr") or f"Falha ao copiar {filename} do device")
+
+    def push_local_sqlite_bundle(
+        self,
+        *,
+        package_name: str,
+        access_mode: str,
+        root_relative: str,
+        remote_root: str,
+        database_name: str,
+        local_dir: Path,
+        package_meta: dict[str, Any],
+    ) -> dict[str, Any]:
+        listing = self.list_remote_sqlite_entries(package_name, access_mode, root_relative, remote_root)
+        local_filenames = [name for name in [database_name, f"{database_name}-wal", f"{database_name}-shm", f"{database_name}-journal"] if (local_dir / name).exists()]
+        if database_name not in local_filenames:
+            raise RuntimeError("Arquivo principal do banco nao existe localmente para write-back")
+        timestamp = int(time.time() * 1000)
+        backed_up: list[str] = []
+        pushed: list[str] = []
+        removed_remote: list[str] = []
+        existing_remote = set(listing["entries"])
+        for filename in [name for name in [database_name, f"{database_name}-wal", f"{database_name}-shm", f"{database_name}-journal"] if name in existing_remote]:
+            self.backup_remote_sqlite_file(package_name, access_mode, root_relative, remote_root, filename, timestamp)
+            backed_up.append(filename)
+        for filename in local_filenames:
+            local_path = local_dir / filename
+            if access_mode == "run-as":
+                self.install_remote_sqlite_file(
+                    package_name=package_name,
+                    access_mode=access_mode,
+                    root_relative=root_relative,
+                    remote_root=remote_root,
+                    filename=filename,
+                    temp_remote="",
+                    package_meta=package_meta,
+                    local_path=local_path,
+                )
+                pushed.append(filename)
+                continue
+            temp_remote = f"/data/local/tmp/droidpilot-{timestamp}-{sanitize_filename(filename)}"
+            push_result = self.run_adb_command(
+                command_name="sqlite_push_tmp",
+                adb_args=["push", str(local_path), temp_remote],
+                request_payload={"packageName": package_name, "filename": filename, "tempRemotePath": temp_remote},
+                timeout_seconds=max(self.timeout_seconds, 60.0),
+            )
+            if not push_result["success"]:
+                raise RuntimeError(push_result.get("stderr") or push_result.get("stdout") or f"Falha ao subir {filename} para /data/local/tmp")
+            try:
+                self.install_remote_sqlite_file(
+                    package_name=package_name,
+                    access_mode=access_mode,
+                    root_relative=root_relative,
+                    remote_root=remote_root,
+                    filename=filename,
+                    temp_remote=temp_remote,
+                    package_meta=package_meta,
+                )
+                pushed.append(filename)
+            finally:
+                self.remove_temp_remote_file(temp_remote)
+        for filename in [f"{database_name}-wal", f"{database_name}-shm", f"{database_name}-journal"]:
+            if filename in existing_remote and filename not in local_filenames:
+                self.remove_remote_sqlite_file(package_name, access_mode, root_relative, remote_root, filename)
+                removed_remote.append(filename)
+        return {
+            "packageName": package_name,
+            "databaseName": database_name,
+            "backedUpFiles": backed_up,
+            "pushedFiles": pushed,
+            "removedRemoteFiles": removed_remote,
+        }
+
+    def backup_remote_sqlite_file(self, package_name: str, access_mode: str, root_relative: str, remote_root: str, filename: str, timestamp: int) -> None:
+        backup_name = f"{filename}.bak-{timestamp}"
+        if access_mode == "run-as":
+            result = self.run_adb_command(
+                command_name="sqlite_backup_remote_run_as",
+                adb_args=["shell", "run-as", package_name, "cp", f"{root_relative}/{filename}", f"{root_relative}/{backup_name}"],
+                request_payload={"packageName": package_name, "filename": filename, "backupName": backup_name},
+                timeout_seconds=max(self.timeout_seconds, 30.0),
+            )
+        else:
+            source_path = f"{remote_root}/{filename}"
+            backup_path = f"{remote_root}/{backup_name}"
+            result = self.run_adb_command(
+                command_name="sqlite_backup_remote_root",
+                adb_args=["shell", "su", "-c", f"cp {shlex.quote(source_path)} {shlex.quote(backup_path)}"],
+                request_payload={"packageName": package_name, "filename": filename, "backupName": backup_name},
+                timeout_seconds=max(self.timeout_seconds, 30.0),
+            )
+        if not result["success"]:
+            raise RuntimeError(result.get("stderr") or f"Falha ao criar backup remoto de {filename}")
+
+    def install_remote_sqlite_file(
+        self,
+        *,
+        package_name: str,
+        access_mode: str,
+        root_relative: str,
+        remote_root: str,
+        filename: str,
+        temp_remote: str,
+        package_meta: dict[str, Any],
+        local_path: Path | None = None,
+    ) -> None:
+        if access_mode == "run-as":
+            if local_path is None:
+                raise RuntimeError("local_path eh obrigatorio para write-back via run-as")
+            result = self.run_adb_command(
+                command_name="sqlite_install_remote_run_as",
+                adb_args=["exec-in", "run-as", package_name, "sh", "-c", f"cat > {shlex.quote(f'{root_relative}/{filename}')}"],
+                request_payload={"packageName": package_name, "filename": filename, "accessMode": access_mode},
+                timeout_seconds=max(self.timeout_seconds, 30.0),
+                decode_stdout=False,
+                input_bytes=local_path.read_bytes(),
+            )
+            if not result["success"]:
+                raise RuntimeError(result.get("stderr") or f"Falha ao copiar {filename} de volta para o app")
+            return
+        destination = f"{remote_root}/{filename}"
+        result = self.run_adb_command(
+            command_name="sqlite_install_remote_root",
+            adb_args=["shell", "su", "-c", f"cp {shlex.quote(temp_remote)} {shlex.quote(destination)}"],
+            request_payload={"packageName": package_name, "filename": filename, "tempRemotePath": temp_remote},
+            timeout_seconds=max(self.timeout_seconds, 30.0),
+        )
+        if not result["success"]:
+            raise RuntimeError(result.get("stderr") or f"Falha ao copiar {filename} de volta para o app")
+        app_id = package_meta.get("appId")
+        if app_id:
+            self.run_adb_command(
+                command_name="sqlite_chown_remote_root",
+                adb_args=["shell", "su", "-c", f"chown {app_id}:{app_id} {shlex.quote(destination)}"],
+                request_payload={"packageName": package_name, "filename": filename, "appId": app_id},
+                timeout_seconds=max(self.timeout_seconds, 30.0),
+            )
+            self.run_adb_command(
+                command_name="sqlite_chmod_remote_root",
+                adb_args=["shell", "su", "-c", f"chmod 600 {shlex.quote(destination)}"],
+                request_payload={"packageName": package_name, "filename": filename},
+                timeout_seconds=max(self.timeout_seconds, 30.0),
+            )
+
+    def remove_remote_sqlite_file(self, package_name: str, access_mode: str, root_relative: str, remote_root: str, filename: str) -> None:
+        if access_mode == "run-as":
+            result = self.run_adb_command(
+                command_name="sqlite_remove_remote_run_as",
+                adb_args=["shell", "run-as", package_name, "rm", "-f", f"{root_relative}/{filename}"],
+                request_payload={"packageName": package_name, "filename": filename},
+                timeout_seconds=max(self.timeout_seconds, 30.0),
+            )
+        else:
+            destination = f"{remote_root}/{filename}"
+            result = self.run_adb_command(
+                command_name="sqlite_remove_remote_root",
+                adb_args=["shell", "su", "-c", f"rm -f {shlex.quote(destination)}"],
+                request_payload={"packageName": package_name, "filename": filename},
+                timeout_seconds=max(self.timeout_seconds, 30.0),
+            )
+        if not result["success"]:
+            raise RuntimeError(result.get("stderr") or f"Falha ao remover arquivo remoto {filename}")
+
+    def remove_temp_remote_file(self, temp_remote: str) -> None:
+        self.run_adb_command(
+            command_name="sqlite_remove_tmp",
+            adb_args=["shell", "rm", "-f", temp_remote],
+            request_payload={"tempRemotePath": temp_remote},
+            timeout_seconds=max(self.timeout_seconds, 20.0),
+        )
+
     def run_adb_command(
         self,
         *,
@@ -1032,6 +2085,7 @@ class ServerRuntime:
         decode_stdout: bool = True,
         artifact_path: Path | None = None,
         record_command: bool = True,
+        input_bytes: bytes | None = None,
     ) -> dict[str, Any]:
         adb_path = self.require_adb_path()
         command = [adb_path]
@@ -1050,6 +2104,7 @@ class ServerRuntime:
             completed = subprocess.run(
                 command,
                 capture_output=True,
+                input=input_bytes,
                 text=decode_stdout,
                 encoding="utf-8" if decode_stdout else None,
                 errors="replace" if decode_stdout else None,
@@ -1117,8 +2172,8 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
     mcp = FastMCP(
         name="DroidPilot MCP",
         instructions=(
-            "Use estas tools para operar Android via ADB local. "
-            "Consulte android_adb_config para confirmar o adb e android_get_screen para validar a tela atual."
+            "Use estas tools para operar Android via ADB local, inspecionar SQLite do app alvo e diagnosticar a sessao atual. "
+            "Consulte android_adb_config para confirmar o adb, o packageName resolvido e o estado de auto-update."
         ),
         json_response=True,
         log_level="WARNING",
@@ -1141,6 +2196,22 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
     @mcp.tool(name="android_set_adb_config", description="Atualiza adbPath e adbDeviceSerial em runtime e, por padrao, persiste no config local.", annotations=stateful)
     def android_set_adb_config(adb_path: str = "", adb_device_serial: str = "", persist: bool = True) -> dict[str, Any]:
         return runtime.set_adb_config(adb_path=adb_path, adb_device_serial=adb_device_serial, persist=persist)
+
+    @mcp.tool(name="android_sqlite_status", description="Resolve o packageName do projeto ativo e diagnostica o acesso SQLite via run-as/root.", annotations=read_only)
+    def android_sqlite_status() -> dict[str, Any]:
+        return runtime.sqlite_status(include_databases=False)
+
+    @mcp.tool(name="android_sqlite_list_databases", description="Lista os bancos e arquivos companheiros em databases/ do app alvo.", annotations=read_only)
+    def android_sqlite_list_databases() -> dict[str, Any]:
+        return runtime.sqlite_list_databases()
+
+    @mcp.tool(name="android_sqlite_pull_database", description="Copia um banco SQLite do app alvo para tests/mcp/<timestamp>/artifacts/sqlite.", annotations=read_only)
+    def android_sqlite_pull_database(database_name: str) -> dict[str, Any]:
+        return runtime.sqlite_pull_database(database_name=database_name)
+
+    @mcp.tool(name="android_sqlite_query", description="Executa SQL bruto localmente sobre uma copia do banco e, em caso de mutacao, grava o resultado de volta no app.", annotations=stateful)
+    def android_sqlite_query(database_name: str, sql: str, parameters: list[Any] | None = None, max_rows: int = DEFAULT_SQLITE_MAX_ROWS) -> dict[str, Any]:
+        return runtime.sqlite_query(database_name=database_name, sql=sql, parameters=parameters, max_rows=max_rows)
 
     @mcp.tool(name="android_navigation_guide", description="Retorna a memoria consolidada de navegacao salva por testes anteriores.", annotations=read_only)
     def android_navigation_guide() -> dict[str, Any]:
@@ -1354,9 +2425,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
         args.adb_path = first_text(args.adb_path, config.get("adbPath"), os.environ.get("ANDROID_AGENT_ADB_PATH"))
         args.adb_device_serial = first_text(args.adb_device_serial, config.get("adbDeviceSerial"), os.environ.get("ANDROID_AGENT_ADB_DEVICE_SERIAL"))
+        args.package_name = first_text(config.get("packageName"), os.environ.get("ANDROID_AGENT_PACKAGE_NAME"))
+        args.sqlite_root_path = first_text(config.get("sqliteRootPath"), os.environ.get("ANDROID_AGENT_SQLITE_ROOT_PATH"))
+        args.sqlite_root_access_policy = first_text(
+            config.get("sqliteRootAccessPolicy"),
+            os.environ.get("ANDROID_AGENT_SQLITE_ROOT_ACCESS_POLICY"),
+        ) or "run-as-then-root"
+        args.auto_update_enabled = normalize_bool(
+            first_text(config.get("autoUpdateEnabled"), os.environ.get("ANDROID_AGENT_AUTO_UPDATE_ENABLED")),
+            default=False,
+        )
+        args.update_repo_url = first_text(config.get("updateRepoUrl"), os.environ.get("ANDROID_AGENT_UPDATE_REPO_URL")) or DEFAULT_UPDATE_REPO_URL
+        args.update_channel = first_text(config.get("updateChannel"), os.environ.get("ANDROID_AGENT_UPDATE_CHANNEL")) or DEFAULT_UPDATE_CHANNEL
         args.config_path = config_path
     except ValueError as exc:
         parser.error(str(exc))
+    if args.package_name and not normalize_package_name(str(args.package_name)):
+        parser.error(f"packageName invalido: {args.package_name!r}")
+    if args.sqlite_root_access_policy not in {"run-as-only", "root-only", "run-as-then-root"}:
+        parser.error("sqliteRootAccessPolicy deve ser run-as-only, root-only ou run-as-then-root")
     return args
 
 
@@ -1372,7 +2459,15 @@ def main(argv: list[str] | None = None) -> int:
         config_path=Path(args.config_path),
         adb_path=args.adb_path,
         adb_device_serial=args.adb_device_serial,
+        install_dir=SERVER_DIR,
+        configured_package_name=args.package_name,
+        sqlite_root_path=args.sqlite_root_path,
+        sqlite_root_access_policy=args.sqlite_root_access_policy,
+        auto_update_enabled=args.auto_update_enabled,
+        update_repo_url=args.update_repo_url,
+        update_channel=args.update_channel,
     )
+    runtime.startup_auto_update()
     server = build_server(runtime)
     LOGGER.info("Sessao MCP iniciada em %s", recorder.paths.root)
     if not runtime.detect_adb_path():

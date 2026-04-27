@@ -9,7 +9,9 @@ __pycache__/
 .ruff_cache/
 
 android-agent.config.json
+.droidpilot-update.json
 tests/mcp/
+tests/mcp-*/
 artifacts/
 *.log
 
@@ -22,3 +24,5 @@ build/
 app/build/
 captures/
 local.properties
+
+tests/

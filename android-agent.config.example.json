@@ -2,6 +2,12 @@
   "timeoutSeconds": 12,
   "adbPath": "/opt/android/platform-tools/adb",
   "adbDeviceSerial": "",
+  "packageName": "com.example.app",
+  "sqliteRootPath": "databases",
+  "sqliteRootAccessPolicy": "run-as-then-root",
+  "autoUpdateEnabled": false,
+  "updateRepoUrl": "https://github.com/ronaldomafra/DroidPilot-MCP.git",
+  "updateChannel": "main",
   "artifactsDir": "tests/mcp",
   "navigationMemoryPath": "tests/mcp/navigation/navigation-guide.json"
 }

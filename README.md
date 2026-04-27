@@ -1,5 +1,7 @@
 # DroidPilot MCP
 
+![Visão geral do DroidPilot MCP](docs/images/droidpilot-mcp-overview.png)
+
 DroidPilot MCP é um servidor MCP local para operar dispositivos Android usando apenas ADB. Ele expõe tools para screenshots, gestos de toque, entrada de texto, abrir/parar apps, inspecionar packages, capturar logcat e detectar sinais comuns de instabilidade Android.
 
 O servidor roda por MCP `stdio` por padrão e não exige app Android complementar nem serviço de espelhamento ao vivo.

@@ -27,7 +27,6 @@ local.properties
 
 tests/
 temp/
-dev/
 
 .venv-dev/
 .venv/

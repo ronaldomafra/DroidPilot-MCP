@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ DEFAULT_SCREENSHOT_TIMEOUT_SECONDS = 30.0
 DEFAULT_UPDATE_REPO_URL = "https://github.com/ronaldomafra/DroidPilot-MCP.git"
 DEFAULT_UPDATE_CHANNEL = "main"
 DEFAULT_SQLITE_MAX_ROWS = 200
+DEFAULT_TOOL_MAX_ITEMS = 20
 UPDATE_STATE_FILENAME = ".droidpilot-update.json"
 
 try:
@@ -59,6 +61,7 @@ NAVIGATION_EVENT_ACTIONS = {
     "back",
     "home",
     "scroll",
+    "ui_context",
 }
 LOGCAT_ISSUE_PATTERNS = [
     {
@@ -271,6 +274,14 @@ class NavigationMemory:
         notes: str = "",
         confidence: float = 0.7,
         app_package: str = "",
+        source_type: str = "",
+        navigation_mode: str = "",
+        screen_fingerprint: str = "",
+        key_texts: list[str] | None = None,
+        key_resource_ids: list[str] | None = None,
+        key_content_descs: list[str] | None = None,
+        current_activity: str = "",
+        focused_window: str = "",
     ) -> dict[str, Any]:
         display_screen_name = screen_name.strip()
         display_goal = goal.strip()
@@ -285,6 +296,14 @@ class NavigationMemory:
         actions = normalize_string_list(useful_actions)
         checks = normalize_string_list(assertions)
         blocker_items = normalize_string_list(blockers)
+        source_type_value = normalize_ui_text(source_type)
+        navigation_mode_value = normalize_ui_text(navigation_mode)
+        fingerprint_value = normalize_ui_text(screen_fingerprint)
+        key_text_items = normalize_string_list(key_texts)
+        key_resource_id_items = normalize_string_list(key_resource_ids)
+        key_content_desc_items = normalize_string_list(key_content_descs)
+        current_activity_value = normalize_activity_name(current_activity)
+        focused_window_value = normalize_ui_text(focused_window)
         note_text = notes.strip()
         package_name = app_package.strip()
 
@@ -303,6 +322,14 @@ class NavigationMemory:
                     "blockers": [],
                     "notes": [],
                     "packages": [],
+                    "sourceTypes": [],
+                    "navigationModes": [],
+                    "screenFingerprints": [],
+                    "keyTexts": [],
+                    "keyResourceIds": [],
+                    "keyContentDescs": [],
+                    "activities": [],
+                    "focusedWindows": [],
                     "createdAt": now,
                     "updatedAt": now,
                     "confidence": safe_confidence,
@@ -316,6 +343,14 @@ class NavigationMemory:
             screen["assertions"] = merge_unique_strings(screen.get("assertions"), checks)
             screen["blockers"] = merge_unique_strings(screen.get("blockers"), blocker_items)
             screen["packages"] = merge_unique_strings(screen.get("packages"), [package_name] if package_name else [])
+            screen["sourceTypes"] = merge_unique_strings(screen.get("sourceTypes"), [source_type_value] if source_type_value else [])
+            screen["navigationModes"] = merge_unique_strings(screen.get("navigationModes"), [navigation_mode_value] if navigation_mode_value else [])
+            screen["screenFingerprints"] = merge_unique_strings(screen.get("screenFingerprints"), [fingerprint_value] if fingerprint_value else [])
+            screen["keyTexts"] = merge_unique_strings(screen.get("keyTexts"), key_text_items)
+            screen["keyResourceIds"] = merge_unique_strings(screen.get("keyResourceIds"), key_resource_id_items)
+            screen["keyContentDescs"] = merge_unique_strings(screen.get("keyContentDescs"), key_content_desc_items)
+            screen["activities"] = merge_unique_strings(screen.get("activities"), [current_activity_value] if current_activity_value else [])
+            screen["focusedWindows"] = merge_unique_strings(screen.get("focusedWindows"), [focused_window_value] if focused_window_value else [])
             if note_text:
                 screen.setdefault("notes", []).append({"timestamp": now, "text": note_text})
             screen["confidence"] = max(float(screen.get("confidence") or 0.0), safe_confidence)
@@ -363,6 +398,14 @@ class NavigationMemory:
                 "blockers": blocker_items,
                 "notes": notes,
                 "confidence": safe_confidence,
+                "sourceType": source_type_value,
+                "navigationMode": navigation_mode_value,
+                "screenFingerprint": fingerprint_value,
+                "keyTexts": key_text_items,
+                "keyResourceIds": key_resource_id_items,
+                "keyContentDescs": key_content_desc_items,
+                "currentActivity": current_activity_value,
+                "focusedWindow": focused_window_value,
             },
             response_payload={"success": True, "navigationMemoryPath": str(self.path.resolve()), "screenId": screen_id},
         )
@@ -376,9 +419,22 @@ class NavigationMemory:
             "goal": display_goal,
         }
 
-    def context(self, *, goal: str = "", max_items: int = 8) -> dict[str, Any]:
+    def context(
+        self,
+        *,
+        goal: str = "",
+        max_items: int = 8,
+        screen_fingerprint: str = "",
+        current_activity: str = "",
+        source_type: str = "",
+        navigation_mode: str = "",
+    ) -> dict[str, Any]:
         limit = max(1, min(int(max_items or 8), 25))
         goal_text = goal.strip()
+        fingerprint_value = normalize_ui_text(screen_fingerprint)
+        current_activity_value = normalize_activity_name(current_activity)
+        source_type_value = normalize_ui_text(source_type)
+        navigation_mode_value = normalize_ui_text(navigation_mode)
         with self._lock:
             guide = self._read_unlocked()
 
@@ -386,9 +442,39 @@ class NavigationMemory:
         screens = list(project_navigation.get("screens", {}).values())
         routes = list(project_navigation.get("routes", {}).values())
         old_screens = self._legacy_screens(guide)
-        events = list(project_navigation.get("recentEvents") or guide.get("recentEvents") or [])[-limit:]
+        raw_events = list(project_navigation.get("recentEvents") or guide.get("recentEvents") or [])[-limit:]
+        events = [
+            {
+                "timestamp": event.get("timestamp"),
+                "action": event.get("action"),
+                "success": event.get("success"),
+                "sourceType": event.get("sourceType"),
+                "navigationMode": event.get("navigationMode"),
+                "screenFingerprint": event.get("screenFingerprint"),
+                "currentActivity": event.get("currentActivity"),
+                "fallbackRecommended": event.get("fallbackRecommended"),
+            }
+            for event in raw_events
+            if isinstance(event, dict)
+        ]
 
-        filtered_screens = rank_navigation_items(screens + old_screens, goal_text)[:limit]
+        all_screens = screens + old_screens
+        fingerprint_matches: list[dict[str, Any]] = []
+        if fingerprint_value:
+            for screen in all_screens:
+                if fingerprint_value in normalize_string_list(screen.get("screenFingerprints")):
+                    fingerprint_matches.append(screen)
+        activity_matches: list[dict[str, Any]] = []
+        if current_activity_value:
+            for screen in all_screens:
+                if current_activity_value in normalize_string_list(screen.get("activities")) and screen not in fingerprint_matches:
+                    activity_matches.append(screen)
+        filtered_screens = []
+        for screen in fingerprint_matches + activity_matches + rank_navigation_items(all_screens, goal_text):
+            if screen not in filtered_screens:
+                filtered_screens.append(screen)
+            if len(filtered_screens) >= limit:
+                break
         filtered_routes = rank_navigation_items(routes, goal_text)[:limit]
         recommended_steps: list[str] = []
         for route_payload in filtered_routes:
@@ -410,16 +496,38 @@ class NavigationMemory:
                     "screenName": screen.get("screenName"),
                     "goals": normalize_string_list(screen.get("goals"))[:3],
                     "visualCues": normalize_string_list(screen.get("visualCues"))[:3],
+                    "sourceTypes": normalize_string_list(screen.get("sourceTypes"))[:3],
+                    "navigationModes": normalize_string_list(screen.get("navigationModes"))[:3],
+                    "screenFingerprints": normalize_string_list(screen.get("screenFingerprints"))[:3],
+                    "activities": normalize_string_list(screen.get("activities"))[:3],
                     "assertions": normalize_string_list(screen.get("assertions"))[:3],
                     "confidence": screen.get("confidence"),
                 }
             )
+
+        matched_by_fingerprint = bool(fingerprint_matches)
+        matched_by_activity = bool(activity_matches)
+        preferred_navigation_mode = navigation_mode_value or ""
+        if fingerprint_matches and normalize_string_list(fingerprint_matches[0].get("navigationModes")):
+            preferred_navigation_mode = normalize_string_list(fingerprint_matches[0].get("navigationModes"))[0]
+        elif activity_matches and normalize_string_list(activity_matches[0].get("navigationModes")):
+            preferred_navigation_mode = normalize_string_list(activity_matches[0].get("navigationModes"))[0]
+        elif source_type_value == "webview":
+            preferred_navigation_mode = "visual"
+        elif not preferred_navigation_mode:
+            preferred_navigation_mode = "structured"
+
+        visual_fallback_recommended = preferred_navigation_mode in {"visual", "hybrid"} or source_type_value == "webview"
 
         summary = "Nenhum aprendizado de navegacao salvo ainda."
         if known_screens or recommended_steps or useful_actions:
             summary_parts = []
             if goal_text:
                 summary_parts.append(f"Contexto para objetivo: {goal_text}.")
+            if matched_by_fingerprint:
+                summary_parts.append("Tela atual reconhecida por fingerprint.")
+            elif matched_by_activity:
+                summary_parts.append("Tela atual aproximada por activity.")
             summary_parts.append(f"{len(known_screens)} tela(s) conhecida(s), {len(filtered_routes)} rota(s) relevante(s).")
             summary = " ".join(summary_parts)
 
@@ -432,6 +540,12 @@ class NavigationMemory:
             "usefulActions": useful_actions[:limit],
             "warnings": warnings[:limit],
             "recentEvents": events,
+            "matchedByFingerprint": matched_by_fingerprint,
+            "matchedByActivity": matched_by_activity,
+            "preferredNavigationMode": preferred_navigation_mode,
+            "visualFallbackRecommended": visual_fallback_recommended,
+            "screenFingerprint": fingerprint_value,
+            "currentActivity": current_activity_value,
             "sourcePath": str(self.path.resolve()),
             "navigationMemoryPath": str(self.path.resolve()),
         }
@@ -450,6 +564,13 @@ class NavigationMemory:
             "request": request,
             "artifactPath": result.get("artifactPath"),
             "commandLogPath": result.get("commandLogPath"),
+            "sourceType": result.get("sourceType"),
+            "navigationMode": result.get("navigationMode"),
+            "screenFingerprint": result.get("screenFingerprint"),
+            "currentActivity": result.get("currentActivity"),
+            "matchedElements": result.get("matchedElements"),
+            "fallbackUsed": result.get("fallbackUsed"),
+            "fallbackRecommended": result.get("fallbackRecommended"),
         }
         with self._lock:
             guide = self._read_unlocked()
@@ -616,6 +737,29 @@ def tail_preview(content: str, max_lines: int = 80, max_chars: int = 8000) -> st
     return preview[-max_chars:] if len(preview) > max_chars else preview
 
 
+def normalize_verbosity(value: str = "summary") -> Literal["summary", "focused", "full"]:
+    normalized = normalize_ui_text(value).lower() or "summary"
+    if normalized not in {"summary", "focused", "full"}:
+        raise ValueError("verbosity deve ser summary, focused ou full")
+    return normalized  # type: ignore[return-value]
+
+
+def normalize_max_items(value: int = DEFAULT_TOOL_MAX_ITEMS, upper_bound: int = 100) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_items deve ser numerico") from exc
+    return max(1, min(parsed, upper_bound))
+
+
+def summarize_text(content: str, max_lines: int = 20, max_chars: int = 2000) -> dict[str, Any]:
+    return {
+        "originalLength": len(content),
+        "lineCount": len(content.splitlines()),
+        "preview": tail_preview(content, max_lines=max_lines, max_chars=max_chars),
+    }
+
+
 def find_issue_context(logcat_content: str, pattern: re.Pattern[str], context_lines: int = 2) -> list[str]:
     lines = logcat_content.splitlines()
     snippets: list[str] = []
@@ -681,6 +825,90 @@ def adb_escape_text(text: str) -> str:
     return text.replace("%", "%s").replace(" ", "%s")
 
 
+def normalize_ui_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text)
+
+
+def parse_android_bool(value: Any) -> bool:
+    return str(value or "").strip().lower() == "true"
+
+
+def parse_android_bounds(value: str) -> tuple[int, int, int, int] | None:
+    match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", value.strip())
+    if not match:
+        return None
+    return tuple(int(group) for group in match.groups())
+
+
+def bounds_payload(bounds: tuple[int, int, int, int] | None) -> dict[str, int] | None:
+    if not bounds:
+        return None
+    left, top, right, bottom = bounds
+    return {
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "width": max(0, right - left),
+        "height": max(0, bottom - top),
+    }
+
+
+def bounds_center(bounds: tuple[int, int, int, int] | None) -> tuple[int, int] | None:
+    if not bounds:
+        return None
+    left, top, right, bottom = bounds
+    return ((left + right) // 2, (top + bottom) // 2)
+
+
+def text_preview_items(items: list[str], limit: int = 8) -> list[str]:
+    values: list[str] = []
+    for item in items:
+        text = normalize_ui_text(item)
+        if not text or text in values:
+            continue
+        values.append(text)
+        if len(values) >= limit:
+            break
+    return values
+
+
+def build_screen_fingerprint(
+    *,
+    package_name: str,
+    current_activity: str,
+    focused_window: str,
+    source_type: str,
+    key_texts: list[str],
+    key_resource_ids: list[str],
+    key_content_descs: list[str],
+    key_classes: list[str],
+) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "packageName": normalize_ui_text(package_name),
+        "currentActivity": normalize_ui_text(current_activity),
+        "focusedWindow": normalize_ui_text(focused_window),
+        "sourceType": normalize_ui_text(source_type),
+        "keyTexts": text_preview_items(key_texts, limit=6),
+        "keyResourceIds": text_preview_items(key_resource_ids, limit=6),
+        "keyContentDescs": text_preview_items(key_content_descs, limit=6),
+        "keyClasses": text_preview_items(key_classes, limit=6),
+    }
+    digest = hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return f"screen-{digest}", payload
+
+
+def detect_webview_from_text(*values: str) -> bool:
+    return any("webview" in str(value or "").lower() for value in values)
+
+
+def normalize_activity_name(value: str) -> str:
+    return normalize_ui_text(value)
+
+
 def normalize_bool(value: Any, default: bool = False) -> bool:
     if value is None or value == "":
         return default
@@ -701,6 +929,45 @@ def normalize_package_name(value: str) -> str | None:
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+", candidate):
         return None
     return candidate
+
+
+def parse_adb_devices_output(output: str) -> list[dict[str, Any]]:
+    devices: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("list of devices"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        details: dict[str, str] = {}
+        for part in parts[2:]:
+            if ":" in part:
+                key, value = part.split(":", 1)
+                details[key] = value
+        devices.append(
+            {
+                "serial": parts[0],
+                "state": parts[1],
+                "online": parts[1] == "device",
+                "details": details,
+            }
+        )
+    return devices
+
+
+def is_external_sqlite_root(value: str | None) -> bool:
+    normalized = str(value or "").replace("\\", "/").strip()
+    return normalized.startswith("/sdcard/") or normalized == "/sdcard" or normalized.startswith("/storage/emulated/0/")
+
+
+def normalize_external_sqlite_root(value: str) -> str:
+    normalized = value.replace("\\", "/").strip().rstrip("/")
+    if not is_external_sqlite_root(normalized):
+        raise ValueError("sqlite_root_path externo deve iniciar com /sdcard ou /storage/emulated/0")
+    if "/../" in f"{normalized}/" or normalized.endswith("/.."):
+        raise ValueError("sqlite_root_path externo invalido")
+    return normalized or "/sdcard"
 
 
 def read_text_if_exists(path: Path) -> str | None:
@@ -873,6 +1140,7 @@ class ServerRuntime:
     configured_package_name: str | None
     sqlite_root_path: str | None
     sqlite_root_access_policy: str
+    sqlite_default_database_name: str | None
     auto_update_enabled: bool
     update_repo_url: str
     update_channel: str
@@ -881,6 +1149,7 @@ class ServerRuntime:
         self._package_resolution_cache: dict[str, Any] | None = None
         self._package_meta_cache: dict[str, dict[str, Any]] = {}
         self._update_status_cache: dict[str, Any] | None = None
+        self._sqlite_bundle_cache: dict[str, dict[str, Any]] = {}
 
     def adb_config(self) -> dict[str, Any]:
         detected = self.detect_adb_path()
@@ -898,6 +1167,7 @@ class ServerRuntime:
             "adbDetectedPath": detected,
             "adbAvailable": bool(self.adb_path or detected),
             "adbDeviceSerial": self.adb_device_serial,
+            "selectedDeviceSerial": self.select_adb_device_serial(detected, fail_on_missing=False),
             "artifactsRoot": str(self.recorder.paths.root.resolve()),
             "sessionLogPath": str(self.recorder.paths.session_log.resolve()),
             "navigationMemoryPath": str(self.navigation_memory.path.resolve()),
@@ -922,11 +1192,53 @@ class ServerRuntime:
         }
 
     def set_adb_config(self, adb_path: str = "", adb_device_serial: str = "", persist: bool = True) -> dict[str, Any]:
-        self.adb_path = adb_path.strip() or None
-        self.adb_device_serial = adb_device_serial.strip() or None
+        if adb_path.strip():
+            self.adb_path = adb_path.strip()
+        requested_serial = adb_device_serial.strip()
+        if requested_serial:
+            devices = self.list_adb_devices(self.require_adb_path())
+            known_serials = {str(device.get("serial")) for device in devices}
+            if requested_serial not in known_serials:
+                raise ValueError(f"Device ADB nao encontrado: {requested_serial}")
+        if requested_serial:
+            self.adb_device_serial = requested_serial
         if persist:
             self.persist_config()
         return {"success": True, "message": "ADB configuration updated", "persisted": persist, **self.adb_config()}
+
+    def set_sqlite_config(
+        self,
+        sqlite_root_path: str = "",
+        sqlite_root_access_policy: str = "",
+        default_database_name: str = "",
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        root_path = sqlite_root_path.strip()
+        access_policy = sqlite_root_access_policy.strip() or self.sqlite_root_access_policy or "run-as-then-root"
+        database_name = default_database_name.strip()
+        normalized_root_for_db = root_path.replace("\\", "/")
+        if normalized_root_for_db.lower().endswith(".db"):
+            inferred_database = Path(normalized_root_for_db).name
+            root_path = normalized_root_for_db.rsplit("/", 1)[0] if "/" in normalized_root_for_db else ""
+            if not database_name:
+                database_name = inferred_database
+        if access_policy == "auto":
+            access_policy = "external" if is_external_sqlite_root(root_path or self.sqlite_root_path) else "run-as-then-root"
+        if access_policy not in {"run-as-only", "root-only", "run-as-then-root", "external"}:
+            raise ValueError("sqlite_root_access_policy deve ser auto, run-as-only, root-only, run-as-then-root ou external")
+        if root_path and is_external_sqlite_root(root_path):
+            root_path = normalize_external_sqlite_root(root_path)
+            if not sqlite_root_access_policy.strip():
+                access_policy = "external"
+        if database_name:
+            database_name = ensure_safe_database_name(database_name)
+        self.sqlite_root_path = root_path or self.sqlite_root_path
+        self.sqlite_root_access_policy = access_policy
+        self.sqlite_default_database_name = database_name or self.sqlite_default_database_name
+        self._sqlite_bundle_cache.clear()
+        if persist:
+            self.persist_config()
+        return {"success": True, "message": "SQLite configuration updated", "persisted": persist, "sqlite": self.sqlite_config_status()}
 
     def persist_config(self) -> None:
         payload = load_json_config(self.config_path)
@@ -936,6 +1248,7 @@ class ServerRuntime:
         payload["packageName"] = self.configured_package_name or ""
         payload["sqliteRootPath"] = self.sqlite_root_path or ""
         payload["sqliteRootAccessPolicy"] = self.sqlite_root_access_policy
+        payload["sqliteDefaultDatabaseName"] = self.sqlite_default_database_name or ""
         payload["autoUpdateEnabled"] = self.auto_update_enabled
         payload["updateRepoUrl"] = self.update_repo_url
         payload["updateChannel"] = self.update_channel
@@ -981,6 +1294,24 @@ class ServerRuntime:
             raise ValueError("sqliteRootPath invalido")
         return "/".join(parts)
 
+    def sqlite_config_status(self) -> dict[str, Any]:
+        root_path = self.sqlite_root_path or "databases"
+        access_policy = self.sqlite_root_access_policy
+        is_external = access_policy == "external" or is_external_sqlite_root(root_path)
+        return {
+            "sqliteRootPath": root_path,
+            "sqliteRootAccessPolicy": access_policy,
+            "sqliteDefaultDatabaseName": self.sqlite_default_database_name,
+            "isExternal": is_external,
+            "mode": "external" if is_external else "app-internal",
+        }
+
+    def resolve_sqlite_database_name(self, database_name: str = "") -> str:
+        candidate = database_name.strip() or (self.sqlite_default_database_name or "")
+        if not candidate:
+            raise ValueError("database_name eh obrigatorio ou configure sqliteDefaultDatabaseName com android_set_sqlite_config")
+        return ensure_safe_database_name(candidate)
+
     def package_meta(self, package_name: str) -> dict[str, Any]:
         if package_name in self._package_meta_cache:
             return dict(self._package_meta_cache[package_name])
@@ -1006,11 +1337,29 @@ class ServerRuntime:
         self._package_meta_cache[package_name] = meta
         return dict(meta)
 
-    def navigation_guide(self) -> dict[str, Any]:
-        return {"success": True, "navigationMemoryPath": str(self.navigation_memory.path.resolve()), "guide": self.navigation_memory.read()}
+    def navigation_guide(self, verbosity: str = "summary", goal: str = "", screen_fingerprint: str = "", max_items: int = DEFAULT_TOOL_MAX_ITEMS) -> dict[str, Any]:
+        mode = normalize_verbosity(verbosity)
+        if mode != "full":
+            return self.navigation_context(goal=goal, max_items=max_items, screen_fingerprint=screen_fingerprint)
+        return {"success": True, "verbosity": mode, "navigationMemoryPath": str(self.navigation_memory.path.resolve()), "guide": self.navigation_memory.read()}
 
-    def navigation_context(self, goal: str = "", max_items: int = 8) -> dict[str, Any]:
-        return self.navigation_memory.context(goal=goal, max_items=max_items)
+    def navigation_context(
+        self,
+        goal: str = "",
+        max_items: int = 8,
+        screen_fingerprint: str = "",
+        current_activity: str = "",
+        source_type: str = "",
+        navigation_mode: str = "",
+    ) -> dict[str, Any]:
+        return self.navigation_memory.context(
+            goal=goal,
+            max_items=max_items,
+            screen_fingerprint=screen_fingerprint,
+            current_activity=current_activity,
+            source_type=source_type,
+            navigation_mode=navigation_mode,
+        )
 
     def save_navigation_note(
         self,
@@ -1046,6 +1395,14 @@ class ServerRuntime:
         notes: str = "",
         confidence: float = 0.7,
         app_package: str = "",
+        source_type: str = "",
+        navigation_mode: str = "",
+        screen_fingerprint: str = "",
+        key_texts: list[str] | None = None,
+        key_resource_ids: list[str] | None = None,
+        key_content_descs: list[str] | None = None,
+        current_activity: str = "",
+        focused_window: str = "",
     ) -> dict[str, Any]:
         return self.navigation_memory.save_learning(
             screen_name=screen_name,
@@ -1058,10 +1415,22 @@ class ServerRuntime:
             notes=notes,
             confidence=confidence,
             app_package=app_package,
+            source_type=source_type,
+            navigation_mode=navigation_mode,
+            screen_fingerprint=screen_fingerprint,
+            key_texts=key_texts,
+            key_resource_ids=key_resource_ids,
+            key_content_descs=key_content_descs,
+            current_activity=current_activity,
+            focused_window=focused_window,
         )
 
     def adb_status(self) -> dict[str, Any]:
         payload = self.run_adb_command(command_name="adb_status", adb_args=["devices", "-l"])
+        devices = parse_adb_devices_output(str(payload.get("stdout") or ""))
+        payload["devices"] = devices
+        payload["onlineDevices"] = [device for device in devices if device.get("online")]
+        payload["selectedDeviceSerial"] = self.select_adb_device_serial(payload.get("adbPath"), fail_on_missing=False)
         payload["adbConfig"] = self.adb_config()
         return payload
 
@@ -1069,6 +1438,38 @@ class ServerRuntime:
         try:
             package_name = self.resolve_package_name()
             package_meta = self.package_meta(package_name)
+            configured_root = self.sqlite_root_path or "databases"
+            external_root = self.sqlite_root_access_policy == "external" or is_external_sqlite_root(configured_root)
+            if external_root:
+                remote_root = normalize_external_sqlite_root(configured_root)
+                access = {
+                    "accessMode": "external",
+                    "canRead": True,
+                    "canWrite": False,
+                    "message": "SQLite directory configured on shared storage",
+                    "attempts": [],
+                }
+                payload = {
+                    "success": True,
+                    "packageName": package_name,
+                    "rootRelativePath": None,
+                    "remoteRootPath": remote_root,
+                    "accessPolicy": self.sqlite_root_access_policy,
+                    "accessMode": "external",
+                    "canRead": True,
+                    "canWrite": False,
+                    "readOnly": True,
+                    "defaultDatabaseName": self.sqlite_default_database_name,
+                    "installed": package_meta.get("installed"),
+                    "debuggable": package_meta.get("debuggable"),
+                    "appId": package_meta.get("appId"),
+                    "message": access["message"],
+                    "attempts": access["attempts"],
+                }
+                if include_databases:
+                    listing = self.list_remote_sqlite_entries(package_name, "external", "", remote_root)
+                    payload.update(listing)
+                return payload
             root_relative = self.sqlite_root_relative_path()
             data_dir = package_meta.get("dataDir") or f"/data/user/0/{package_name}"
             remote_root = f"{data_dir.rstrip('/')}/{root_relative}"
@@ -1082,6 +1483,8 @@ class ServerRuntime:
                 "accessMode": access["accessMode"],
                 "canRead": access["canRead"],
                 "canWrite": access["canWrite"],
+                "readOnly": not access["canWrite"],
+                "defaultDatabaseName": self.sqlite_default_database_name,
                 "installed": package_meta.get("installed"),
                 "debuggable": package_meta.get("debuggable"),
                 "appId": package_meta.get("appId"),
@@ -1167,29 +1570,37 @@ class ServerRuntime:
         companion_suffixes = ("-wal", "-shm", "-journal")
         databases = [entry for entry in entries if not entry.endswith(companion_suffixes) and ".bak-" not in entry]
         companion_files = [entry for entry in entries if entry.endswith(companion_suffixes)]
+        backup_files = [entry for entry in entries if ".bak-" in entry]
+        visible_entries = entries[:80]
         return {
-            "entries": entries,
+            "entries": visible_entries,
+            "allEntries": entries,
+            "entryCount": len(entries),
             "databases": databases,
             "companionFiles": companion_files,
+            "backupCount": len(backup_files),
             "commandLogPath": result.get("commandLogPath"),
+            "truncated": len(visible_entries) < len(entries),
         }
 
     def sqlite_list_databases(self) -> dict[str, Any]:
         status = self.sqlite_status(include_databases=True)
+        status.pop("allEntries", None)
         status["message"] = "SQLite databases listed successfully" if status["success"] else status["message"]
         return status
 
-    def sqlite_pull_database(self, database_name: str) -> dict[str, Any]:
-        database_name = ensure_safe_database_name(database_name)
+    def sqlite_pull_database(self, database_name: str = "", refresh: bool = False) -> dict[str, Any]:
+        database_name = self.resolve_sqlite_database_name(database_name)
         status = self.sqlite_status(include_databases=False)
         if not status["canRead"]:
             raise RuntimeError(status["message"])
         bundle = self.pull_remote_sqlite_bundle(
             package_name=str(status["packageName"]),
             access_mode=str(status["accessMode"]),
-            root_relative=str(status["rootRelativePath"]),
+            root_relative=str(status.get("rootRelativePath") or ""),
             remote_root=str(status["remoteRootPath"]),
             database_name=database_name,
+            refresh=refresh,
         )
         return {
             "success": True,
@@ -1204,8 +1615,8 @@ class ServerRuntime:
             "remoteRootPath": status["remoteRootPath"],
         }
 
-    def sqlite_query(self, database_name: str, sql: str, parameters: list[Any] | None = None, max_rows: int = DEFAULT_SQLITE_MAX_ROWS) -> dict[str, Any]:
-        database_name = ensure_safe_database_name(database_name)
+    def sqlite_query(self, database_name: str = "", sql: str = "", parameters: list[Any] | None = None, max_rows: int = DEFAULT_SQLITE_MAX_ROWS) -> dict[str, Any]:
+        database_name = self.resolve_sqlite_database_name(database_name)
         sql = sql.strip()
         if not sql:
             raise ValueError("sql eh obrigatorio")
@@ -1220,9 +1631,10 @@ class ServerRuntime:
         bundle = self.pull_remote_sqlite_bundle(
             package_name=str(status["packageName"]),
             access_mode=str(status["accessMode"]),
-            root_relative=str(status["rootRelativePath"]),
+            root_relative=str(status.get("rootRelativePath") or ""),
             remote_root=str(status["remoteRootPath"]),
             database_name=database_name,
+            refresh=statement_kind == "write",
         )
         local_backup_dir: Path | None = None
         if statement_kind == "write":
@@ -1281,6 +1693,332 @@ class ServerRuntime:
             "writeBack": write_back,
         }
 
+    def ui_context(
+        self,
+        verbosity: str = "summary",
+        max_items: int = DEFAULT_TOOL_MAX_ITEMS,
+        text_filter: str = "",
+        resource_id_filter: str = "",
+        package_filter: str = "",
+        include_xml: bool = False,
+    ) -> dict[str, Any]:
+        mode = normalize_verbosity(verbosity)
+        limit = normalize_max_items(max_items)
+        xml_path = self.dump_ui_hierarchy()
+        xml_content = xml_path.read_text(encoding="utf-8", errors="replace")
+        nodes = self.parse_ui_hierarchy(xml_content)
+        window_info = self.window_focus_info()
+        ui_package = self.infer_ui_package(nodes)
+        window_package = normalize_ui_text(str(window_info.get("currentPackage") or ""))
+        current_package = ui_package or window_package or self.resolve_package_name()
+        window_activity = normalize_activity_name(str(window_info.get("currentActivity") or ""))
+        effective_activity = window_activity if window_activity.startswith(f"{current_package}/") else normalize_activity_name(str(window_info.get("visibleActivity") or window_activity))
+        focus_mismatch = bool(ui_package and window_package and ui_package != window_package)
+        visible_texts = text_preview_items(
+            [node.get("text", "") for node in nodes] + [node.get("contentDesc", "") for node in nodes],
+            limit=limit,
+        )
+        clickable_elements = [node for node in nodes if bool(node.get("clickable")) and node.get("bounds")]
+        editable_elements = [node for node in nodes if bool(node.get("editable")) and node.get("bounds")]
+        scrollable_elements = [node for node in nodes if bool(node.get("scrollable")) and node.get("bounds")]
+        key_resource_ids = text_preview_items([str(node.get("resourceId") or "") for node in clickable_elements + editable_elements], limit=10)
+        key_content_descs = text_preview_items([str(node.get("contentDesc") or "") for node in clickable_elements], limit=10)
+        key_classes = text_preview_items([str(node.get("className") or "") for node in clickable_elements + editable_elements + scrollable_elements], limit=10)
+        focused_window = normalize_ui_text(str(window_info.get("focusedWindow") or ""))
+        source_type = self.classify_ui_source(nodes, window_info)
+        navigation_mode, fallback_recommended, fallback_reason, confidence = self.evaluate_navigation_mode(source_type, nodes, visible_texts, clickable_elements)
+        fallback_method = "screenshot" if fallback_recommended else ""
+        if fallback_recommended:
+            agent_hint = "Use android_get_screen before deciding the next tap."
+        else:
+            agent_hint = "Use clickableElements and bounds from this response for navigation."
+        screen_fingerprint, fingerprint_parts = build_screen_fingerprint(
+            package_name=current_package,
+            current_activity=effective_activity,
+            focused_window=focused_window,
+            source_type=source_type,
+            key_texts=visible_texts,
+            key_resource_ids=key_resource_ids,
+            key_content_descs=key_content_descs,
+            key_classes=key_classes,
+        )
+        screen_bounds = self.estimate_screen_bounds(nodes)
+        matching_nodes = self.filter_ui_nodes(
+            nodes,
+            text_filter=text_filter,
+            resource_id_filter=resource_id_filter,
+            package_filter=package_filter,
+        )
+        payload = {
+            "success": True,
+            "message": "UI context captured successfully",
+            "verbosity": mode,
+            "sourceType": source_type,
+            "navigationMode": navigation_mode,
+            "fallbackRecommended": fallback_recommended,
+            "fallbackMethod": fallback_method,
+            "fallbackReason": fallback_reason,
+            "agentHint": agent_hint,
+            "confidence": confidence,
+            "currentPackage": current_package,
+            "effectivePackage": current_package,
+            "uiPackage": ui_package,
+            "windowPackage": window_package,
+            "focusMismatch": focus_mismatch,
+            "currentActivity": effective_activity,
+            "windowActivity": window_activity,
+            "focusedWindow": focused_window,
+            "screenBounds": screen_bounds,
+            "screenFingerprint": screen_fingerprint,
+            "visibleTexts": visible_texts,
+            "clickableElements": clickable_elements[:limit],
+            "editableElements": editable_elements[:limit],
+            "scrollableElements": scrollable_elements[:limit],
+            "matches": matching_nodes[:limit],
+            "found": bool(matching_nodes),
+            "matchedElements": {
+                "clickable": len(clickable_elements),
+                "editable": len(editable_elements),
+                "scrollable": len(scrollable_elements),
+                "visibleTexts": len(visible_texts),
+                "matches": len(matching_nodes),
+                "nodes": len(nodes),
+            },
+            "xmlArtifactPath": str(xml_path.resolve()),
+            "artifactPath": str(xml_path.resolve()),
+            "path": str(xml_path.resolve()),
+            "xmlOriginalLength": len(xml_content),
+            "fallbackUsed": False,
+        }
+        if mode == "full":
+            payload["screenFingerprintParts"] = fingerprint_parts
+            payload["allClickableElements"] = clickable_elements
+            payload["allEditableElements"] = editable_elements
+            payload["allScrollableElements"] = scrollable_elements
+        if include_xml:
+            payload["xml"] = xml_content
+        self.navigation_memory.record_automatic_event(action="ui_context", result=payload)
+        return payload
+
+    def dump_ui_hierarchy(self) -> Path:
+        xml_path = self.recorder.paths.artifacts_dir / "window_dump.xml"
+        dump_result = self.run_adb_command(
+            command_name="ui_dump",
+            adb_args=["shell", "uiautomator", "dump", "/sdcard/window_dump.xml"],
+            timeout_seconds=max(self.timeout_seconds, 20.0),
+            record_stdout_max_chars=4000,
+        )
+        if not dump_result["success"]:
+            raise RuntimeError(dump_result.get("stderr") or dump_result.get("stdout") or "Falha ao gerar uiautomator dump")
+        pull_result = self.run_adb_command(
+            command_name="ui_dump_pull",
+            adb_args=["exec-out", "cat", "/sdcard/window_dump.xml"],
+            timeout_seconds=max(self.timeout_seconds, 20.0),
+            decode_stdout=False,
+            artifact_path=xml_path,
+        )
+        if not pull_result["success"]:
+            raise RuntimeError(pull_result.get("stderr") or pull_result.get("stdout") or "Falha ao ler XML da UI")
+        return xml_path
+
+    def parse_ui_hierarchy(self, xml_content: str) -> list[dict[str, Any]]:
+        try:
+            root = ET.fromstring(xml_content)
+        except ET.ParseError as exc:
+            raise RuntimeError("Falha ao fazer parse do XML de UI do Android") from exc
+        nodes: list[dict[str, Any]] = []
+
+        def walk(element: ET.Element, depth: int) -> None:
+            if element.tag == "node":
+                attrs = element.attrib
+                bounds = parse_android_bounds(attrs.get("bounds", ""))
+                center = bounds_center(bounds)
+                payload = bounds_payload(bounds)
+                node = {
+                    "text": normalize_ui_text(attrs.get("text")),
+                    "contentDesc": normalize_ui_text(attrs.get("content-desc")),
+                    "resourceId": normalize_ui_text(attrs.get("resource-id")),
+                    "className": normalize_ui_text(attrs.get("class")),
+                    "packageName": normalize_ui_text(attrs.get("package")),
+                    "clickable": parse_android_bool(attrs.get("clickable")),
+                    "enabled": parse_android_bool(attrs.get("enabled")),
+                    "scrollable": parse_android_bool(attrs.get("scrollable")),
+                    "focused": parse_android_bool(attrs.get("focused")),
+                    "editable": "edittext" in normalize_ui_text(attrs.get("class")).lower(),
+                    "checkable": parse_android_bool(attrs.get("checkable")),
+                    "checked": parse_android_bool(attrs.get("checked")),
+                    "bounds": payload,
+                    "centerX": center[0] if center else None,
+                    "centerY": center[1] if center else None,
+                    "depth": depth,
+                }
+                if any(
+                    [
+                        node["text"],
+                        node["contentDesc"],
+                        node["resourceId"],
+                        node["clickable"],
+                        node["editable"],
+                        node["scrollable"],
+                    ]
+                ):
+                    nodes.append(node)
+            for child in element:
+                walk(child, depth + 1)
+
+        walk(root, 0)
+        return nodes
+
+    def infer_ui_package(self, nodes: list[dict[str, Any]]) -> str:
+        counts: dict[str, int] = {}
+        for node in nodes:
+            package_name = normalize_ui_text(node.get("packageName"))
+            if not package_name:
+                continue
+            counts[package_name] = counts.get(package_name, 0) + 1
+        if not counts:
+            return ""
+        return sorted(counts.items(), key=lambda item: item[1], reverse=True)[0][0]
+
+    def filter_ui_nodes(
+        self,
+        nodes: list[dict[str, Any]],
+        *,
+        text_filter: str = "",
+        resource_id_filter: str = "",
+        package_filter: str = "",
+    ) -> list[dict[str, Any]]:
+        text_value = normalize_ui_text(text_filter).lower()
+        resource_value = normalize_ui_text(resource_id_filter).lower()
+        package_value = normalize_ui_text(package_filter).lower()
+        if not text_value and not resource_value and not package_value:
+            return []
+        matches: list[dict[str, Any]] = []
+        for node in nodes:
+            text_blob = " ".join([str(node.get("text") or ""), str(node.get("contentDesc") or "")]).lower()
+            resource_id = str(node.get("resourceId") or "").lower()
+            package_name = str(node.get("packageName") or "").lower()
+            text_matches = bool(text_value and text_value in text_blob)
+            resource_matches = bool(resource_value and resource_value in resource_id)
+            if (text_value or resource_value) and not (text_matches or resource_matches):
+                continue
+            if package_value and package_value not in package_name:
+                continue
+            matches.append(node)
+        return matches
+
+    def window_focus_info(self) -> dict[str, Any]:
+        window_result = self.run_adb_command(
+            command_name="window_focus_info",
+            adb_args=["shell", "dumpsys", "window", "windows"],
+            timeout_seconds=max(self.timeout_seconds, 20.0),
+            record_stdout_max_chars=16000,
+        )
+        activity_result = self.run_adb_command(
+            command_name="activity_top_info",
+            adb_args=["shell", "dumpsys", "activity", "top"],
+            timeout_seconds=max(self.timeout_seconds, 20.0),
+            record_stdout_max_chars=16000,
+        )
+        window_stdout = str(window_result.get("stdout") or "")
+        activity_stdout = str(activity_result.get("stdout") or "")
+        focused_window = ""
+        current_activity = ""
+        current_package = ""
+        visible_activity = ""
+        for pattern in (
+            r"mCurrentFocus=Window\{[^\}]+\s([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)\}",
+            r"mFocusedApp=.*? ([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)",
+        ):
+            match = re.search(pattern, window_stdout)
+            if match:
+                focused_window = normalize_ui_text(match.group(1))
+                break
+        activity_match = re.search(r"\bACTIVITY\s+([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)", activity_stdout)
+        if activity_match:
+            current_activity = normalize_activity_name(activity_match.group(1))
+        visible_matches = re.findall(
+            r"Window #\d+ Window\{[^\n]+ ([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)\}:[\s\S]{0,1800}?isOnScreen=true[\s\S]{0,200}?isVisible=true",
+            window_stdout,
+        )
+        if visible_matches:
+            visible_activity = normalize_activity_name(visible_matches[0])
+        if current_activity:
+            current_package = current_activity.split("/", 1)[0]
+        elif focused_window:
+            current_activity = focused_window
+            current_package = focused_window.split("/", 1)[0]
+        if visible_activity and (not current_activity or "launcher" in current_activity.lower()):
+            current_activity = visible_activity
+            current_package = current_activity.split("/", 1)[0]
+        return {
+            "focusedWindow": focused_window,
+            "currentActivity": current_activity,
+            "currentPackage": current_package,
+            "visibleActivity": visible_activity,
+            "windowDumpArtifact": window_result.get("commandLogPath"),
+            "activityDumpArtifact": activity_result.get("commandLogPath"),
+        }
+
+    def classify_ui_source(self, nodes: list[dict[str, Any]], window_info: dict[str, Any]) -> str:
+        class_names = " ".join(str(node.get("className") or "") for node in nodes).lower()
+        resource_ids = " ".join(str(node.get("resourceId") or "") for node in nodes).lower()
+        focused_window = str(window_info.get("focusedWindow") or "")
+        current_activity = str(window_info.get("currentActivity") or "")
+        has_webview = detect_webview_from_text(class_names, resource_ids, focused_window, current_activity)
+        has_compose = "compose" in class_names or "compose" in current_activity.lower()
+        clickable_count = sum(1 for node in nodes if node.get("clickable"))
+        text_count = sum(1 for node in nodes if node.get("text") or node.get("contentDesc"))
+        if has_webview and (clickable_count > 0 or text_count > 0):
+            return "hybrid"
+        if has_webview:
+            return "webview"
+        if has_compose:
+            return "compose"
+        if clickable_count > 0 or text_count > 0:
+            return "views"
+        return "unknown"
+
+    def evaluate_navigation_mode(
+        self,
+        source_type: str,
+        nodes: list[dict[str, Any]],
+        visible_texts: list[str],
+        clickable_elements: list[dict[str, Any]],
+    ) -> tuple[str, bool, str, float]:
+        clickable_count = len(clickable_elements)
+        useful_count = clickable_count + len(visible_texts)
+        generic_node_count = sum(1 for node in nodes if not node.get("text") and not node.get("contentDesc") and not node.get("resourceId"))
+        weak_tree = useful_count < 4 or (nodes and generic_node_count / max(len(nodes), 1) > 0.65)
+        if source_type == "webview":
+            return "visual", True, "UI tree insuficiente para WebView", 0.35
+        if source_type == "hybrid":
+            return "hybrid", True, "Tela hibrida com area estruturada e area visual", 0.55
+        if source_type == "compose":
+            if weak_tree:
+                return "hybrid", True, "Compose com arvore de acessibilidade fraca", 0.45
+            return "structured", False, "", 0.75
+        if source_type == "views":
+            if weak_tree:
+                return "hybrid", True, "Arvore de UI com poucos elementos confiaveis", 0.6
+            return "structured", False, "", 0.9
+        if weak_tree:
+            return "visual", True, "Arvore de UI vazia ou ambigua", 0.25
+        return "structured", False, "", 0.65
+
+    def estimate_screen_bounds(self, nodes: list[dict[str, Any]]) -> dict[str, int] | None:
+        right = 0
+        bottom = 0
+        for node in nodes:
+            bounds = node.get("bounds")
+            if not isinstance(bounds, dict):
+                continue
+            right = max(right, int(bounds.get("right") or 0))
+            bottom = max(bottom, int(bounds.get("bottom") or 0))
+        if right <= 0 or bottom <= 0:
+            return None
+        return {"left": 0, "top": 0, "right": right, "bottom": bottom, "width": right, "height": bottom}
+
     def get_screen(self, include_base64: bool = False, filename: str | None = None) -> dict[str, Any]:
         artifact_name = safe_artifact_filename(filename, "screen", ".png") if filename else "screen.png"
         artifact_path = self.recorder.paths.artifacts_dir / artifact_name
@@ -1319,7 +2057,8 @@ class ServerRuntime:
         result["count"] = len(packages)
         return result
 
-    def app_info(self, package_name: str) -> dict[str, Any]:
+    def app_info(self, package_name: str, verbosity: str = "summary", include_raw_preview: bool = False) -> dict[str, Any]:
+        mode = normalize_verbosity(verbosity)
         package_name = package_name.strip()
         if not package_name:
             raise ValueError("package_name eh obrigatorio")
@@ -1331,12 +2070,53 @@ class ServerRuntime:
             record_stdout_max_chars=20000,
         )
         stdout = str(result.get("stdout") or "")
-        result["packageName"] = package_name
-        result["installed"] = package_name in stdout
-        result["launcherActivities"] = sorted(set(re.findall(rf"{re.escape(package_name)}/[A-Za-z0-9_.$]+", stdout)))
-        result["content_preview"] = tail_preview(stdout, max_lines=120, max_chars=12000)
-        result["contentPreview"] = result["content_preview"]
-        return result
+        launcher_activities = self.extract_launcher_activities(package_name, stdout)
+        requested_permissions = re.findall(r"^\s+(android\.permission\.[A-Z0-9_]+|[A-Za-z0-9_.]+\.permission\.[A-Za-z0-9_]+)$", stdout, flags=re.MULTILINE)
+        version_code = first_int_match(r"\bversionCode=(\d+)", stdout)
+        version_name_match = re.search(r"\bversionName=([^\s]+)", stdout)
+        summary = {
+            "success": result["success"],
+            "message": "App info captured successfully" if result["success"] else "Failed to capture app info",
+            "verbosity": mode,
+            "packageName": package_name,
+            "installed": package_name in stdout,
+            "versionCode": version_code,
+            "versionName": version_name_match.group(1) if version_name_match else None,
+            "debuggable": "DEBUGGABLE" in stdout,
+            "launcherActivity": launcher_activities[0] if launcher_activities else None,
+            "launcherActivities": launcher_activities,
+            "criticalPermissions": [permission for permission in requested_permissions if permission in {
+                "android.permission.MANAGE_EXTERNAL_STORAGE",
+                "android.permission.SYSTEM_ALERT_WINDOW",
+                "android.permission.QUERY_ALL_PACKAGES",
+                "android.permission.ACCESS_FINE_LOCATION",
+                "android.permission.ACCESS_BACKGROUND_LOCATION",
+                "android.permission.READ_EXTERNAL_STORAGE",
+                "android.permission.WRITE_EXTERNAL_STORAGE",
+            }],
+            "requestedPermissionCount": len(requested_permissions),
+            "stdoutOriginalLength": len(stdout),
+            "commandLogPath": result.get("commandLogPath"),
+            "returnCode": result.get("returnCode"),
+            "stderr": result.get("stderr"),
+            "adbPath": result.get("adbPath"),
+            "deviceSerial": result.get("deviceSerial"),
+        }
+        if include_raw_preview or mode == "full":
+            summary["content_preview"] = tail_preview(stdout, max_lines=120, max_chars=12000)
+            summary["contentPreview"] = summary["content_preview"]
+        if mode == "full":
+            summary["stdout"] = stdout
+            summary["argv"] = result.get("argv")
+        return summary
+
+    def extract_launcher_activities(self, package_name: str, dumpsys_output: str) -> list[str]:
+        launchers: list[str] = []
+        for block in re.findall(r"([A-Fa-f0-9]+\s+" + re.escape(package_name) + r"/[A-Za-z0-9_.$]+[\s\S]{0,260}?Category: \"android.intent.category.LAUNCHER\")", dumpsys_output):
+            match = re.search(rf"{re.escape(package_name)}/[A-Za-z0-9_.$]+", block)
+            if match and match.group(0) not in launchers:
+                launchers.append(match.group(0))
+        return launchers
 
     def open_app(self, package_name: str, activity_name: str | None = None) -> dict[str, Any]:
         package_name = package_name.strip()
@@ -1431,7 +2211,7 @@ class ServerRuntime:
         result["message"] = "Logcat cleared successfully" if result["success"] else "Failed to clear logcat"
         return result
 
-    def get_logcat(self) -> dict[str, Any]:
+    def get_logcat(self, include_preview: bool = True, max_preview_chars: int = 8000) -> dict[str, Any]:
         result = self.run_adb_command(command_name="get_logcat", adb_args=["logcat", "-d"], timeout_seconds=max(self.timeout_seconds, 30.0), record_stdout_max_chars=12000)
         logcat_content = str(result.get("stdout") or "")
         logcat_path = self.save_logcat_artifact(logcat_content)
@@ -1439,26 +2219,30 @@ class ServerRuntime:
             {
                 "path": str(logcat_path.resolve()),
                 "logcatPath": str(logcat_path.resolve()),
-                "content_preview": tail_preview(logcat_content),
-                "contentPreview": tail_preview(logcat_content),
+                "stdoutOriginalLength": len(logcat_content),
                 "message": "Logcat captured successfully" if result["success"] else "Failed to capture logcat",
             }
         )
+        result.pop("stdout", None)
+        if include_preview:
+            result["content_preview"] = tail_preview(logcat_content, max_chars=max_preview_chars)
+            result["contentPreview"] = result["content_preview"]
         return result
 
-    def detect_known_issues(self) -> dict[str, Any]:
+    def detect_known_issues(self, include_preview: bool = False, preview_on_issue: bool = True, max_preview_chars: int = 8000) -> dict[str, Any]:
         result = self.run_adb_command(command_name="detect_known_issues", adb_args=["logcat", "-d"], timeout_seconds=max(self.timeout_seconds, 30.0), record_stdout_max_chars=12000)
         logcat_content = str(result.get("stdout") or "")
         logcat_path = self.save_logcat_artifact(logcat_content)
         detection = detect_logcat_issues(logcat_content)
+        has_issue = bool(detection.get("summary"))
         detection.update(
             {
                 "success": result["success"],
                 "message": "Known issue detection completed" if result["success"] else "Failed to capture logcat for known issue detection",
                 "path": str(logcat_path.resolve()),
                 "logcatPath": str(logcat_path.resolve()),
-                "content_preview": tail_preview(logcat_content),
-                "contentPreview": tail_preview(logcat_content),
+                "stdoutOriginalLength": len(logcat_content),
+                "lineCount": len(logcat_content.splitlines()),
                 "commandLogPath": result.get("commandLogPath"),
                 "returnCode": result.get("returnCode"),
                 "stderr": result.get("stderr"),
@@ -1466,6 +2250,9 @@ class ServerRuntime:
                 "deviceSerial": result.get("deviceSerial"),
             }
         )
+        if include_preview or (preview_on_issue and has_issue):
+            detection["content_preview"] = tail_preview(logcat_content, max_chars=max_preview_chars)
+            detection["contentPreview"] = detection["content_preview"]
         return detection
 
     def save_logcat_artifact(self, content: str) -> Path:
@@ -1770,6 +2557,41 @@ class ServerRuntime:
             "ou instale Android platform-tools no PATH."
         )
 
+    def list_adb_devices(self, adb_path: str | None = None) -> list[dict[str, Any]]:
+        path = adb_path or self.require_adb_path()
+        completed = subprocess.run(
+            [path, "devices", "-l"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(self.timeout_seconds, 10.0),
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(completed.stderr.strip() or "Falha ao listar devices ADB")
+        return parse_adb_devices_output(str(completed.stdout))
+
+    def select_adb_device_serial(self, adb_path: str | None = None, fail_on_missing: bool = True) -> str | None:
+        if self.adb_device_serial:
+            return self.adb_device_serial
+        try:
+            devices = self.list_adb_devices(adb_path)
+        except Exception:
+            if fail_on_missing:
+                raise
+            return None
+        online = [device for device in devices if device.get("online")]
+        if len(online) == 1:
+            return str(online[0]["serial"])
+        if not online and devices and fail_on_missing:
+            states = ", ".join(f"{device.get('serial')}={device.get('state')}" for device in devices)
+            raise RuntimeError(f"Nenhum device ADB online ({states}). Conecte um device ou ajuste adbDeviceSerial.")
+        if len(online) > 1 and fail_on_missing:
+            serials = ", ".join(str(device["serial"]) for device in online)
+            raise RuntimeError(f"Mais de um device ADB online ({serials}). Defina adbDeviceSerial com android_set_adb_config.")
+        return None
+
     def run_host_command(
         self,
         command_name: str,
@@ -1833,6 +2655,14 @@ class ServerRuntime:
                 timeout_seconds=max(self.timeout_seconds, 20.0),
                 record_stdout_max_chars=8000,
             )
+        if access_mode == "external":
+            return self.run_adb_command(
+                command_name="sqlite_list_dir_external",
+                adb_args=["shell", "ls", "-1", remote_root],
+                request_payload={"packageName": package_name, "remoteRootPath": remote_root, "accessMode": access_mode},
+                timeout_seconds=max(self.timeout_seconds, 20.0),
+                record_stdout_max_chars=8000,
+            )
         raise RuntimeError("SQLite access mode indisponivel")
 
     def pull_remote_sqlite_bundle(
@@ -1843,15 +2673,23 @@ class ServerRuntime:
         root_relative: str,
         remote_root: str,
         database_name: str,
+        refresh: bool = False,
     ) -> dict[str, Any]:
+        cache_key = f"{access_mode}|{remote_root}|{database_name}"
+        if not refresh and cache_key in self._sqlite_bundle_cache:
+            cached = self._sqlite_bundle_cache[cache_key]
+            database_path = cached.get("databasePath")
+            if isinstance(database_path, Path) and database_path.exists():
+                return cached
         listing = self.list_remote_sqlite_entries(package_name, access_mode, root_relative, remote_root)
-        if database_name not in listing["databases"] and database_name not in listing["entries"]:
+        all_entries = listing.get("allEntries") or listing["entries"]
+        if database_name not in listing["databases"] and database_name not in all_entries:
             raise RuntimeError(f"Banco SQLite nao encontrado: {database_name}")
         artifact_dir = self.recorder.paths.artifacts_dir / "sqlite" / f"{sanitize_filename(database_name)}-{int(time.time() * 1000)}"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         files: dict[str, Path] = {}
         for filename in [database_name, f"{database_name}-wal", f"{database_name}-shm", f"{database_name}-journal"]:
-            if filename not in listing["entries"]:
+            if filename not in all_entries:
                 continue
             local_path = artifact_dir / filename
             self.copy_remote_sqlite_file(
@@ -1865,11 +2703,13 @@ class ServerRuntime:
             files[filename] = local_path
         if database_name not in files:
             raise RuntimeError(f"Nao foi possivel copiar o banco SQLite {database_name}")
-        return {
+        bundle = {
             "artifactDir": artifact_dir,
             "databasePath": files[database_name],
             "files": files,
         }
+        self._sqlite_bundle_cache[cache_key] = bundle
+        return bundle
 
     def copy_remote_sqlite_file(
         self,
@@ -1894,6 +2734,15 @@ class ServerRuntime:
             result = self.run_adb_command(
                 command_name="sqlite_pull_file_root",
                 adb_args=["exec-out", "su", "-c", f"cat {shlex.quote(f'{remote_root}/{filename}')}"],
+                request_payload={"packageName": package_name, "filename": filename, "accessMode": access_mode},
+                timeout_seconds=max(self.timeout_seconds, 30.0),
+                decode_stdout=False,
+                artifact_path=local_path,
+            )
+        elif access_mode == "external":
+            result = self.run_adb_command(
+                command_name="sqlite_pull_file_external",
+                adb_args=["exec-out", "cat", f"{remote_root}/{filename}"],
                 request_payload={"packageName": package_name, "filename": filename, "accessMode": access_mode},
                 timeout_seconds=max(self.timeout_seconds, 30.0),
                 decode_stdout=False,
@@ -2089,13 +2938,14 @@ class ServerRuntime:
     ) -> dict[str, Any]:
         adb_path = self.require_adb_path()
         command = [adb_path]
-        if self.adb_device_serial:
-            command.extend(["-s", self.adb_device_serial])
+        selected_serial = None if adb_args[:2] == ["devices", "-l"] else self.select_adb_device_serial(adb_path, fail_on_missing=True)
+        if selected_serial:
+            command.extend(["-s", selected_serial])
         command.extend(adb_args)
         request = {
             "transport": "adb",
             "adbPath": adb_path,
-            "deviceSerial": self.adb_device_serial,
+            "deviceSerial": selected_serial,
             "argv": command,
             "shellCommand": " ".join(shlex.quote(part) for part in command),
             **(request_payload or {}),
@@ -2133,7 +2983,7 @@ class ServerRuntime:
                 "stdout": stdout,
                 "stderr": stderr_value,
                 "adbPath": adb_path,
-                "deviceSerial": self.adb_device_serial,
+                "deviceSerial": selected_serial,
                 "argv": command,
                 "timestamp": int(time.time() * 1000),
             }
@@ -2172,8 +3022,8 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
     mcp = FastMCP(
         name="DroidPilot MCP",
         instructions=(
-            "Use estas tools para operar Android via ADB local, inspecionar SQLite do app alvo e diagnosticar a sessao atual. "
-            "Consulte android_adb_config para confirmar o adb, o packageName resolvido e o estado de auto-update."
+            "Use estas tools para operar Android via ADB local, inspecionar SQLite do app alvo, navegar por UI tree quando possivel e recorrer a screenshot quando a tela exigir fallback visual. "
+            "Consulte android_ui_context para decidir entre navegacao estruturada e visual."
         ),
         json_response=True,
         log_level="WARNING",
@@ -2197,6 +3047,38 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
     def android_set_adb_config(adb_path: str = "", adb_device_serial: str = "", persist: bool = True) -> dict[str, Any]:
         return runtime.set_adb_config(adb_path=adb_path, adb_device_serial=adb_device_serial, persist=persist)
 
+    @mcp.tool(name="android_set_sqlite_config", description="Configura root/politica/default de SQLite em runtime e, por padrao, persiste no config local.", annotations=stateful)
+    def android_set_sqlite_config(
+        sqlite_root_path: str = "",
+        sqlite_root_access_policy: str = "",
+        default_database_name: str = "",
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        return runtime.set_sqlite_config(
+            sqlite_root_path=sqlite_root_path,
+            sqlite_root_access_policy=sqlite_root_access_policy,
+            default_database_name=default_database_name,
+            persist=persist,
+        )
+
+    @mcp.tool(name="android_ui_context", description="Captura a hierarquia atual da UI via uiautomator dump, classifica a tela e indica se o agente deve usar navegacao estruturada ou screenshot.", annotations=read_only)
+    def android_ui_context(
+        verbosity: str = "summary",
+        max_items: int = DEFAULT_TOOL_MAX_ITEMS,
+        text_filter: str = "",
+        resource_id_filter: str = "",
+        package_filter: str = "",
+        include_xml: bool = False,
+    ) -> dict[str, Any]:
+        return runtime.ui_context(
+            verbosity=verbosity,
+            max_items=max_items,
+            text_filter=text_filter,
+            resource_id_filter=resource_id_filter,
+            package_filter=package_filter,
+            include_xml=include_xml,
+        )
+
     @mcp.tool(name="android_sqlite_status", description="Resolve o packageName do projeto ativo e diagnostica o acesso SQLite via run-as/root.", annotations=read_only)
     def android_sqlite_status() -> dict[str, Any]:
         return runtime.sqlite_status(include_databases=False)
@@ -2206,20 +3088,34 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
         return runtime.sqlite_list_databases()
 
     @mcp.tool(name="android_sqlite_pull_database", description="Copia um banco SQLite do app alvo para tests/mcp/<timestamp>/artifacts/sqlite.", annotations=read_only)
-    def android_sqlite_pull_database(database_name: str) -> dict[str, Any]:
-        return runtime.sqlite_pull_database(database_name=database_name)
+    def android_sqlite_pull_database(database_name: str = "", refresh: bool = False) -> dict[str, Any]:
+        return runtime.sqlite_pull_database(database_name=database_name, refresh=refresh)
 
     @mcp.tool(name="android_sqlite_query", description="Executa SQL bruto localmente sobre uma copia do banco e, em caso de mutacao, grava o resultado de volta no app.", annotations=stateful)
-    def android_sqlite_query(database_name: str, sql: str, parameters: list[Any] | None = None, max_rows: int = DEFAULT_SQLITE_MAX_ROWS) -> dict[str, Any]:
+    def android_sqlite_query(database_name: str = "", sql: str = "", parameters: list[Any] | None = None, max_rows: int = DEFAULT_SQLITE_MAX_ROWS) -> dict[str, Any]:
         return runtime.sqlite_query(database_name=database_name, sql=sql, parameters=parameters, max_rows=max_rows)
 
     @mcp.tool(name="android_navigation_guide", description="Retorna a memoria consolidada de navegacao salva por testes anteriores.", annotations=read_only)
-    def android_navigation_guide() -> dict[str, Any]:
-        return runtime.navigation_guide()
+    def android_navigation_guide(verbosity: str = "summary", goal: str = "", screen_fingerprint: str = "", max_items: int = DEFAULT_TOOL_MAX_ITEMS) -> dict[str, Any]:
+        return runtime.navigation_guide(verbosity=verbosity, goal=goal, screen_fingerprint=screen_fingerprint, max_items=max_items)
 
-    @mcp.tool(name="android_navigation_context", description="Retorna um contexto curto e acionavel para orientar o CLI durante testes.", annotations=read_only)
-    def android_navigation_context(goal: str = "", max_items: int = 8) -> dict[str, Any]:
-        return runtime.navigation_context(goal=goal, max_items=max_items)
+    @mcp.tool(name="android_navigation_context", description="Retorna um contexto curto e acionavel para orientar o CLI durante testes, incluindo match por fingerprint e modo de navegacao preferido.", annotations=read_only)
+    def android_navigation_context(
+        goal: str = "",
+        max_items: int = 8,
+        screen_fingerprint: str = "",
+        current_activity: str = "",
+        source_type: str = "",
+        navigation_mode: str = "",
+    ) -> dict[str, Any]:
+        return runtime.navigation_context(
+            goal=goal,
+            max_items=max_items,
+            screen_fingerprint=screen_fingerprint,
+            current_activity=current_activity,
+            source_type=source_type,
+            navigation_mode=navigation_mode,
+        )
 
     @mcp.tool(name="android_save_navigation_note", description="Salva uma orientacao de menu/tela para facilitar testes futuros do app.", annotations=stateful)
     def android_save_navigation_note(
@@ -2253,6 +3149,14 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
         notes: str = "",
         confidence: float = 0.7,
         app_package: str = "",
+        source_type: str = "",
+        navigation_mode: str = "",
+        screen_fingerprint: str = "",
+        key_texts: list[str] | None = None,
+        key_resource_ids: list[str] | None = None,
+        key_content_descs: list[str] | None = None,
+        current_activity: str = "",
+        focused_window: str = "",
     ) -> dict[str, Any]:
         return runtime.save_navigation_learning(
             screen_name=screen_name,
@@ -2265,6 +3169,14 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
             notes=notes,
             confidence=confidence,
             app_package=app_package,
+            source_type=source_type,
+            navigation_mode=navigation_mode,
+            screen_fingerprint=screen_fingerprint,
+            key_texts=key_texts,
+            key_resource_ids=key_resource_ids,
+            key_content_descs=key_content_descs,
+            current_activity=current_activity,
+            focused_window=focused_window,
         )
 
     @mcp.tool(name="android_get_screen", description="Captura a tela atual via ADB screencap e salva a imagem em tests/mcp.", annotations=read_only)
@@ -2276,8 +3188,8 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
         return runtime.list_apps(query=query)
 
     @mcp.tool(name="android_app_info", description="Retorna diagnostico de instalacao e possiveis launchers para um package name.", annotations=read_only)
-    def android_app_info(package_name: str) -> dict[str, Any]:
-        return runtime.app_info(package_name=package_name)
+    def android_app_info(package_name: str, verbosity: str = "summary", include_raw_preview: bool = False) -> dict[str, Any]:
+        return runtime.app_info(package_name=package_name, verbosity=verbosity, include_raw_preview=include_raw_preview)
 
     @mcp.tool(name="android_open_app", description="Abre um app via ADB usando package name e, opcionalmente, uma activity explicita.", annotations=stateful)
     def android_open_app(package_name: str, activity_name: str = "") -> dict[str, Any]:
@@ -2328,12 +3240,12 @@ def build_server(runtime: ServerRuntime) -> FastMCP:
         return runtime.clear_logcat()
 
     @mcp.tool(name="android_get_logcat", description="Captura o dump atual do logcat via ADB e salva em tests/mcp/<timestamp>/artifacts/logcat.txt.", annotations=read_only)
-    def android_get_logcat() -> dict[str, Any]:
-        return runtime.get_logcat()
+    def android_get_logcat(include_preview: bool = True, max_preview_chars: int = 8000) -> dict[str, Any]:
+        return runtime.get_logcat(include_preview=include_preview, max_preview_chars=max_preview_chars)
 
     @mcp.tool(name="android_detect_known_issues", description="Captura logcat via ADB e detecta crashes, ANR, WindowLeaked e excecoes Android conhecidas.", annotations=read_only)
-    def android_detect_known_issues() -> dict[str, Any]:
-        return runtime.detect_known_issues()
+    def android_detect_known_issues(include_preview: bool = False, preview_on_issue: bool = True, max_preview_chars: int = 8000) -> dict[str, Any]:
+        return runtime.detect_known_issues(include_preview=include_preview, preview_on_issue=preview_on_issue, max_preview_chars=max_preview_chars)
 
     return mcp
 
@@ -2431,6 +3343,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             config.get("sqliteRootAccessPolicy"),
             os.environ.get("ANDROID_AGENT_SQLITE_ROOT_ACCESS_POLICY"),
         ) or "run-as-then-root"
+        args.sqlite_default_database_name = first_text(
+            config.get("sqliteDefaultDatabaseName"),
+            os.environ.get("ANDROID_AGENT_SQLITE_DEFAULT_DATABASE_NAME"),
+        )
         args.auto_update_enabled = normalize_bool(
             first_text(config.get("autoUpdateEnabled"), os.environ.get("ANDROID_AGENT_AUTO_UPDATE_ENABLED")),
             default=False,
@@ -2442,8 +3358,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(str(exc))
     if args.package_name and not normalize_package_name(str(args.package_name)):
         parser.error(f"packageName invalido: {args.package_name!r}")
-    if args.sqlite_root_access_policy not in {"run-as-only", "root-only", "run-as-then-root"}:
-        parser.error("sqliteRootAccessPolicy deve ser run-as-only, root-only ou run-as-then-root")
+    if args.sqlite_root_access_policy == "auto":
+        args.sqlite_root_access_policy = "external" if is_external_sqlite_root(args.sqlite_root_path) else "run-as-then-root"
+    if args.sqlite_root_access_policy not in {"run-as-only", "root-only", "run-as-then-root", "external"}:
+        parser.error("sqliteRootAccessPolicy deve ser auto, run-as-only, root-only, run-as-then-root ou external")
+    if args.sqlite_default_database_name:
+        args.sqlite_default_database_name = ensure_safe_database_name(str(args.sqlite_default_database_name))
     return args
 
 
@@ -2463,6 +3383,7 @@ def main(argv: list[str] | None = None) -> int:
         configured_package_name=args.package_name,
         sqlite_root_path=args.sqlite_root_path,
         sqlite_root_access_policy=args.sqlite_root_access_policy,
+        sqlite_default_database_name=args.sqlite_default_database_name,
         auto_update_enabled=args.auto_update_enabled,
         update_repo_url=args.update_repo_url,
         update_channel=args.update_channel,

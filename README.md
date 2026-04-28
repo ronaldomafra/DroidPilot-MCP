@@ -6,6 +6,17 @@ DroidPilot MCP é um servidor MCP local para operar dispositivos Android usando 
 
 O servidor roda por MCP `stdio` por padrão e não exige app Android complementar nem serviço de espelhamento ao vivo.
 
+## Release 2026-04-28
+
+Esta versão foca em reduzir consumo de tokens e aumentar robustez em testes Android reais:
+
+- `android_ui_context` agora aceita `verbosity`, filtros por texto/resource-id/package e retorna `matches` para asserts objetivos sem depender de screenshot.
+- O MCP passa a recomendar fallback visual para WebView, Compose com árvore fraca ou telas ambíguas.
+- `android_set_sqlite_config` permite definir root, policy e banco SQLite padrão em runtime, incluindo bancos externos em `/sdcard/...` em modo leitura.
+- `android_set_adb_config` valida o serial informado e o runtime auto-seleciona o único device online quando outros estão offline.
+- `android_app_info`, `android_detect_known_issues`, `android_get_logcat` e `android_navigation_guide` retornam respostas compactas por padrão, mantendo dumps completos em artifacts.
+- A memória de navegação passa a usar fingerprint, activity efetiva e modo de navegação preferido para orientar agentes com menos contexto.
+
 ## Requisitos
 
 - Python 3.10+
@@ -118,6 +129,7 @@ Exemplo:
   "packageName": "com.example.app",
   "sqliteRootPath": "databases",
   "sqliteRootAccessPolicy": "run-as-then-root",
+  "sqliteDefaultDatabaseName": "",
   "autoUpdateEnabled": false,
   "updateRepoUrl": "https://github.com/ronaldomafra/DroidPilot-MCP.git",
   "updateChannel": "main",
@@ -133,7 +145,7 @@ Precedência de configuração:
 3. variáveis de ambiente como `ANDROID_AGENT_ADB_PATH` e `ANDROID_AGENT_ADB_DEVICE_SERIAL`
 4. autodetecção
 
-`artifactsDir` e `navigationMemoryPath` também são relativos ao projeto ativo por padrão. `packageName` deve apontar para o app Android do projeto ativo quando a inferência automática não for suficiente. `sqliteRootAccessPolicy` aceita `run-as-only`, `root-only` ou `run-as-then-root`. Se `autoUpdateEnabled` estiver `true`, o MCP tenta atualizar a instalação no startup e marca `restartRequired` no status quando houver mudança aplicada.
+`artifactsDir` e `navigationMemoryPath` também são relativos ao projeto ativo por padrão. `packageName` deve apontar para o app Android do projeto ativo quando a inferência automática não for suficiente. `sqliteRootAccessPolicy` aceita `auto`, `run-as-only`, `root-only`, `run-as-then-root` ou `external`. Para bancos externos, use `sqliteRootPath` em `/sdcard/...` ou `/storage/emulated/0/...`; o acesso inicial é somente leitura. `sqliteDefaultDatabaseName` permite consultar sem repetir `database_name`. Se `autoUpdateEnabled` estiver `true`, o MCP tenta atualizar a instalação no startup e marca `restartRequired` no status quando houver mudança aplicada.
 
 Se o projeto ativo for versionado, adicione `android-agent.config.json` e `tests/mcp/` ao `.gitignore` dele.
 
@@ -219,7 +231,8 @@ claude mcp get DroidPilot-MCP
 
 - `android_adb_config`: retorna a configuração ADB efetiva e os paths da sessão.
 - `android_adb_autodetect`: procura `adb` no `PATH` e em locais comuns do Android SDK.
-- `android_set_adb_config`: atualiza `adbPath` e `adbDeviceSerial` em runtime e persiste por padrão.
+- `android_set_adb_config`: atualiza `adbPath` e `adbDeviceSerial` em runtime, valida o serial e persiste por padrão.
+- `android_set_sqlite_config`: atualiza root/política/default de SQLite em runtime e persiste por padrão.
 
 `android_adb_config` e `android_agent_status` também expõem:
 
@@ -243,6 +256,8 @@ Exemplo de entrada para a tool:
 - `android_adb_config`
 - `android_adb_autodetect`
 - `android_set_adb_config`
+- `android_set_sqlite_config`
+- `android_ui_context`
 - `android_sqlite_status`
 - `android_sqlite_list_databases`
 - `android_sqlite_pull_database`
@@ -271,17 +286,29 @@ Exemplo de entrada para a tool:
 
 ## Tools SQLite
 
-- `android_sqlite_status`: resolve o `packageName` do projeto ativo e testa acesso via `run-as` e/ou root.
-- `android_sqlite_list_databases`: lista os bancos em `databases/` e arquivos companheiros como `-wal` e `-shm`.
-- `android_sqlite_pull_database`: copia o banco para `tests/mcp/<timestamp>/artifacts/sqlite`.
-- `android_sqlite_query`: executa SQL bruto localmente em uma cópia do banco; se a instrução for mutável, envia o resultado de volta para o sandbox do app.
+- `android_sqlite_status`: resolve o `packageName` do projeto ativo e testa acesso via `run-as`, root ou path externo configurado.
+- `android_set_sqlite_config`: define `sqliteRootPath`, `sqliteRootAccessPolicy` e `sqliteDefaultDatabaseName`.
+- `android_sqlite_list_databases`: lista bancos, arquivos companheiros como `-wal`/`-shm` e compacta listas grandes de backups.
+- `android_sqlite_pull_database`: copia o banco default ou informado para `tests/mcp/<timestamp>/artifacts/sqlite`.
+- `android_sqlite_query`: executa SQL bruto localmente em uma cópia do banco; se `database_name` vier vazio, usa `sqliteDefaultDatabaseName`.
 
 Observações:
 
 - Em devices sem `sqlite3` no shell Android, o MCP consulta o banco localmente com `sqlite3` do Python.
 - Para apps debugáveis, o caminho preferencial é `run-as`.
 - Se `run-as` falhar e a policy permitir, o MCP tenta fallback por root.
+- Para bancos externos, configure `sqliteRootAccessPolicy=external` e `sqliteRootPath=/sdcard/...`; nessa versão o acesso externo é somente leitura.
+- Se a IA receber o caminho completo do arquivo `.db`, pode enviar esse caminho em `sqlite_root_path`; o MCP separa diretório e `sqliteDefaultDatabaseName` automaticamente.
 - Escrita em SQLite exige cuidado com app aberto e concorrência de arquivo. O MCP cria backup remoto com sufixo `.bak-<timestamp>` antes de sobrescrever.
+
+## Tools de UI Context
+
+- `android_ui_context`: captura a hierarquia atual via `uiautomator dump`, aceita `verbosity`, `max_items` e filtros por texto/resource-id/package, classifica a tela como `views`, `compose`, `webview`, `hybrid` ou `unknown` e informa se o agente deve navegar por estrutura ou por screenshot.
+- A resposta inclui `navigationMode`, `fallbackRecommended`, `agentHint`, `screenFingerprint`, `visibleTexts`, `clickableElements` e `xmlArtifactPath`.
+- Regra prática:
+  - `structured`: prefira `clickableElements` e `bounds`
+  - `visual`: use `android_get_screen`
+  - `hybrid`: combine UI tree com fallback visual
 
 ## Fluxo Recomendado
 
@@ -291,11 +318,13 @@ Observações:
 4. Consulte `android_sqlite_status` para validar `packageName`, `run-as` e fallback root quando precisar mexer no banco.
 5. Execute `android_clear_logcat` antes de um teste.
 6. Abra o app com `android_open_app` ou `android_adb_open_app`.
-7. Use `android_get_screen`, `android_tap`, `android_swipe`, `android_input_text`, `android_back`, `android_home` e `android_scroll`.
-8. Use `android_sqlite_list_databases`, `android_sqlite_pull_database` ou `android_sqlite_query` quando precisar inspecionar ou ajustar SQLite.
-9. Execute `android_detect_known_issues` ao final.
-10. Consulte `android_navigation_context` antes de navegar para reutilizar aprendizado do projeto.
-11. Salve notas reutilizáveis de navegação com `android_save_navigation_note` ou `android_save_navigation_learning`.
+7. Execute `android_ui_context` para decidir se a tela atual deve ser tratada por UI tree ou por screenshot.
+8. Use `android_tap`, `android_swipe`, `android_input_text`, `android_back`, `android_home` e `android_scroll`.
+9. Use `android_get_screen` principalmente para validação visual e fallback de telas como WebView.
+10. Use `android_sqlite_list_databases`, `android_sqlite_pull_database` ou `android_sqlite_query` quando precisar inspecionar ou ajustar SQLite.
+11. Execute `android_detect_known_issues` ao final.
+12. Consulte `android_navigation_context` antes de navegar para reutilizar aprendizado do projeto.
+13. Salve notas reutilizáveis de navegação com `android_save_navigation_note` ou `android_save_navigation_learning`.
 
 `android_get_screen` grava screenshots em `<projeto-ativo>/tests/mcp/<timestamp>/artifacts`. Logs de comandos são gravados em `<projeto-ativo>/tests/mcp/<timestamp>/commands`. A memória de navegação fica em `<projeto-ativo>/tests/mcp/navigation/navigation-guide.json`, salvo override.
 
@@ -320,6 +349,9 @@ na tool `android_navigation_context`. Ela retorna:
 - `usefulActions`: ações úteis já aprendidas
 - `warnings`: bloqueios ou cuidados conhecidos
 - `recentEvents`: eventos recentes da automação
+- `matchedByFingerprint`: indica se a tela atual foi reconhecida estruturalmente
+- `preferredNavigationMode`: sugere `structured`, `visual` ou `hybrid`
+- `visualFallbackRecommended`: sinaliza se a tela deve recorrer a screenshot
 
 Depois de descobrir uma tela, rota ou comportamento importante, salve o aprendizado com `android_save_navigation_learning`:
 
@@ -342,6 +374,14 @@ Depois de descobrir uma tela, rota ou comportamento importante, salve o aprendiz
   ],
   "assertions": [
     "A tela deve exibir o título Configurações"
+  ],
+  "source_type": "views",
+  "navigation_mode": "structured",
+  "screen_fingerprint": "screen-abc123",
+  "current_activity": "com.exemplo/.SettingsActivity",
+  "key_texts": [
+    "Configurações",
+    "Preferências"
   ],
   "blockers": [
     "Se houver diálogo de permissão, aceitar antes de tocar na engrenagem"
@@ -366,6 +406,8 @@ Os padrões detectados incluem `FATAL EXCEPTION`, `WindowLeaked`, `ANR`, `Illega
 - Se `adbAvailable` for falso, instale Android platform-tools ou execute `android_set_adb_config`.
 - Se houver mais de um device conectado, defina `adbDeviceSerial`.
 - Se tools de screenshot ou input falharem, confirme que o device está autorizado e aparece em `adb devices`.
+- Se `android_ui_context` retornar `navigationMode=visual`, trate a tela como fallback visual e use `android_get_screen` antes do próximo tap.
+- Se uma tela Compose vier com poucos elementos úteis no XML, use `android_get_screen` e salve esse comportamento no aprendizado com `navigation_mode=hybrid` ou `visual`.
 - Se `android_sqlite_status` falhar em `run-as`, confirme se o app é debugável. Se não for, use root ou um fluxo de exportação do próprio app.
 - Se `android_sqlite_query` alterar o banco e o app não refletir a mudança, feche/reabra o app para evitar cache ou lock de SQLite/WAL.
 - Se o startup aplicar auto-update, reinicie o cliente MCP quando `restartRequired` estiver `true`.

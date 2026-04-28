@@ -5,6 +5,7 @@
   "packageName": "com.example.app",
   "sqliteRootPath": "databases",
   "sqliteRootAccessPolicy": "run-as-then-root",
+  "sqliteDefaultDatabaseName": "",
   "autoUpdateEnabled": false,
   "updateRepoUrl": "https://github.com/ronaldomafra/DroidPilot-MCP.git",
   "updateChannel": "main",
